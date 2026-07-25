@@ -1,0 +1,12 @@
+packages:
+  - 'apps/*'
+  - 'packages/*'
+
+# Chỉ các gói này được phép chạy script cài đặt (build/postinstall) — chặn
+# arbitrary-script-execution từ dependency. pnpm 10 đọc thiết lập này ở ĐÂY
+# (không còn ở trường "pnpm" trong package.json); giữ cả hai nơi để pnpm 9
+# (pinned qua packageManager) vẫn áp qua package.json.
+onlyBuiltDependencies:
+  - esbuild
+  - sharp
+  - workerd

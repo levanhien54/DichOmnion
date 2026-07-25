@@ -1,0 +1,56 @@
+[project]
+name = "gpu-worker"
+version = "0.1.0"
+description = "FastAPI GPU Worker for OmniVoice Dubbing"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.111.0",
+    "uvicorn>=0.30.1",
+    "torch>=2.3.1",
+    "pydantic>=2.7.4",
+    "numpy>=1.26.4",
+    "PyJWT>=2.8.0",
+    "cryptography>=42.0.0",
+    "faster-whisper>=1.0.2",
+    "httpx>=0.27.0",
+    "edge-tts>=6.1.12",
+    "pydub>=0.25.1",
+    "python-multipart>=0.0.32",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.2.2",
+    "pytest-asyncio>=0.23.7"
+]
+# Bộ TĂNG CƯỜNG cho audio_engine.py — fail-soft: worker vẫn chạy nếu thiếu và báo
+# TRUNG THỰC trong `notes` (chưa tách nền / chưa watermark). Để KHÔNG ép stack nặng
+# này vào đường chạy mặc định (`uv run`), khai báo dưới dạng extra tùy chọn.
+# Cài khi triển khai GPU:  uv sync --extra enhance   (hoặc: pip install -r requirements.txt)
+#   - torchaudio: đọc/ghi wav cho AudioSeal
+#   - demucs:     tách nhạc nền (gọi qua CLI `demucs`)
+#   - audioseal:  watermark ẩn (`from audioseal import AudioSeal`)
+enhance = [
+    "torchaudio>=2.3.1",
+    "demucs>=4.0.1",
+    "audioseal>=0.1.4",
+]
+# Dịch CỤC BỘ bằng Qwen thường trú VRAM (thay OpenAI cloud — đóng lỗ rò transcript,
+# tiêu chí #2). Cùng khuôn fail-soft như `enhance`: translation_service.load_model()
+# fail-closed (raise) nếu thiếu — KHÔNG ép stack transformers nặng vào đường chạy/test
+# mặc định trên máy CPU-only. Cài khi triển khai GPU:  uv sync --extra local-llm
+#   - transformers: AutoModelForCausalLM / AutoTokenizer nạp Qwen in-process.
+#   - accelerate:   device_map / nạp trọng số hiệu quả lên GPU.
+# GHI CHÚ (residual_hardware): trọng số int4 AWQ/GPTQ cần kernel CUDA + gói lượng tử
+# (autoawq/gptqmodel) và guided-decoding (xgrammar/outlines) là lever CHẤT LƯỢNG chỉ
+# kiểm chứng được trên GPU — thêm khi lên phần cứng thật, không giả xanh ở đây.
+local-llm = [
+    "transformers>=4.51",
+    "accelerate>=0.30",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["."]

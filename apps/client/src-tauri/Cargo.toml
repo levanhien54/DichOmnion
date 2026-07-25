@@ -1,0 +1,23 @@
+[package]
+name = "omnivoice"
+version = "1.0.0"
+description = "A Zero-Trust AI Dubbing Studio"
+authors = ["you"]
+license = ""
+repository = ""
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "1.5", features = [] }
+
+[dependencies]
+tauri = { version = "1.5", features = [ "shell-sidecar", "dialog-all" ] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+# Băm MD5 để client kiểm tra toàn vẹn audio đã tách trước khi upload.
+md5 = "0.7"
+# Mã hóa base64 để đưa bytes audio qua cầu IPC lên webview (tải lên R2/S3).
+base64 = "0.22"
+
+[features]
+custom-protocol = ["tauri/custom-protocol"]

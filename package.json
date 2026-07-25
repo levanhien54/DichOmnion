@@ -1,0 +1,27 @@
+{
+  "name": "dich-omnion-workspace",
+  "private": true,
+  "engines": {
+    "node": ">=18",
+    "pnpm": ">=9"
+  },
+  "packageManager": "pnpm@9.0.0",
+  "scripts": {
+    "dev": "echo 'Run dev for specific app'",
+    "build": "pnpm -r --filter=\"./packages/*\" run build",
+    "test": "pnpm run test:ts && pnpm run test:py",
+    "test:ts": "pnpm -r run test",
+    "test:py": "cd apps/gpu-worker && python -m pytest -q"
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0",
+    "vitest": "^1.0.0"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild",
+      "sharp",
+      "workerd"
+    ]
+  }
+}

@@ -1,0 +1,47 @@
+# OmniVoice GPU Worker — dependencies thật (không có gói giả/thừa).
+# Mỗi gói ở đây tương ứng một import thật trong src/ (đã kiểm bằng grep).
+# Cài: python -m pip install -r requirements.txt
+#
+# LƯU Ý torch/torchaudio: bản pin dưới đây là build CUDA (cu126) dùng cho
+# GPU Model Residence (Trạm/Station GPU). Trên máy có GPU, cài từ index CUDA:
+#   pip install torch==2.13.0 torchaudio==2.11.0 --index-url https://download.pytorch.org/whl/cu126
+# Trên máy chỉ chạy test (CPU) có thể dùng bản CPU tương ứng cùng phiên bản.
+
+# --- API / web layer (src/main.py) ---
+fastapi==0.139.0
+uvicorn==0.51.0
+pydantic==2.13.4
+python-multipart==0.0.32   # FastAPI UploadFile/File trong main.py
+
+# --- Xác thực JWT ES256 worker<->gateway (src/main.py: import jwt) ---
+# cryptography là backend BẮT BUỘC để PyJWT xác minh chữ ký ES256 (bất đối xứng).
+PyJWT==2.13.0
+cryptography==49.0.0
+
+# --- Tải audio_url về để xử lý (src/audio_service.py, src/tts_service.py) ---
+httpx==0.27.0
+
+# --- ASR: Faster-Whisper ghim VRAM (src/asr_service.py) ---
+faster-whisper==1.2.1
+
+# --- Dịch thuật LLM (src/translation_service.py: from openai import OpenAI) ---
+openai==2.48.0
+
+# --- Tổng hợp giọng nói (src/tts_service.py: import edge_tts) ---
+edge-tts==7.2.8
+
+# --- Trộn/xử lý audio (src/audio_engine.py: pydub + torch/torchaudio) ---
+pydub==0.25.1
+torch==2.13.0
+torchaudio==2.11.0
+
+# --- Bộ TĂNG CƯỜNG (tùy chọn nhưng KHUYẾN NGHỊ) cho audio_engine.py ---
+# Demucs: tách nhạc nền (extract_instrumental, gọi qua CLI `demucs`).
+# AudioSeal: gài watermark ẩn (add_watermark, `from audioseal import AudioSeal`).
+# Cả hai đều fail-soft: nếu THIẾU, worker vẫn chạy nhưng báo TRUNG THỰC trong
+# `notes` rằng chưa tách nền / chưa watermark (No-Fake-Success). Trước đây hai gói
+# này được gọi trong code nhưng KHÔNG khai báo ở bất kỳ manifest nào -> người triển
+# khai theo manifest sẽ mất 2 tính năng mà không rõ lý do. Pin phải khớp ma trận
+# torch/CUDA ở trên khi triển khai GPU.
+demucs==4.1.0
+audioseal==0.2.0

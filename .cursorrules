@@ -1,0 +1,35 @@
+# OMNIVOICE-STUDIO (CLIENT-CENTRIC & COMMERCIAL-GRADE) - LLM CODING GUIDELINES
+
+## 🚨 MỤC TIÊU CỐT LÕI 1: BẢO MẬT & KIẾN TRÚC ZERO-TRUST (ANTI-COMPUTE THEFT) 🚨
+1. **Không upload video gốc.** Xử lý video/audio cục bộ bằng FFmpeg.
+2. **Bảo mật Chống Hack GPU (Banking-Level Security):** 
+   - Mã code API ở Gateway BẮT BUỘC phải xác thực Request bằng chữ ký **ECDSA Signature**.
+   - BẮT BUỘC triển khai **3-Way Cross-Validation** (Client <-> Gateway <-> GPU Worker).
+   - Mã code Billing phải có **Kill Switch** tự động sập server nếu vượt ngân sách.
+
+## 🌟 MỤC TIÊU CỐT LÕI 2: CHUẨN THƯƠNG MẠI & KỸ XẢO ÂM THANH ĐIỆN ẢNH 🌟
+Dự án BẮT BUỘC thiết kế theo quy trình 2 bước:
+- **Bước 1 (Analyze):** Dùng MDX23 tách audio làm 2 track (Vocal và Instrumental) -> Nhận diện (faster-whisper/WhisperX) -> Dịch (LLM).
+- **Client (UI):** Người dùng sửa text, gán giọng theo từng người nói (Multi-Speaker Voice Mapping).
+- **Bước 2 (Render - BẮT BUỘC):** 
+   - Sinh giọng (TTS + Emotion) đảm bảo đồng nhất giọng nhân vật.
+   - Khớp thời gian (Rubberband) & Âm vang (Reverb).
+   - **Đặc biệt lưu ý Code Backend:** BẮT BUỘC phải có bước Mix (Trộn) giọng TTS mới đè lên track Nhạc Nền (Instrumental) kèm thuật toán **Auto-Ducking** (Hạ âm lượng nhạc nền khi có tiếng nói) để bảo tồn âm thanh gốc.
+
+## 🚀 MỤC TIÊU CỐT LÕI 3: ÉP XUNG GPU (HARDCORE OPTIMIZATION) 🚀
+1. **Model Residence:** Nạp TẤT CẢ model lên VRAM 1 lần duy nhất lúc khởi động.
+2. **Pipeline Parallelism & CUDA Streams:** Xử lý audio thành chunk và chạy gối đầu song song.
+3. **Memory Hacks:** Bắt buộc khai báo `pin_memory=True` và dùng `FlashAttention-2`.
+
+## 🛡️ MỤC TIÊU CỐT LÕI 4: ỔN ĐỊNH & BẢO MẬT QUYỀN RIÊNG TƯ (SaaS UX) 🛡️
+1. Khi viết code API Queue, **BẮT BUỘC thiết kế Idempotency**. Tự động Retry nếu Worker chết, tuyệt đối không trừ tiền User khi gặp lỗi.
+2. Thiết lập cơ chế **Graceful Degradation**: Khi GPU quá tải, API phải trả về HTTP 202 (Accepted - Xếp hàng) kèm ETA, không được sập (Crash).
+3. **Zero-Logging Privacy:** NGHIÊM CẤM dùng `console.log` hoặc `print` ghi lại Kịch bản văn bản, Audio URL hay IP của User dưới dạng Plain text ra log hệ thống.
+
+## 🧪 MỤC TIÊU CỐT LÕI 5: TIÊU CHUẨN KIỂM THỬ & CHÚ THÍCH (INDUSTRIAL STANDARD) 🧪
+1. **Dự án TypeScript (Client & Gateway):**
+   - Khi viết các hàm logic quan trọng (ECDSA, JWT, Hash), BẮT BUỘC phải viết Unit Test đi kèm bằng **Vitest** (`*.test.ts`).
+   - BẮT BUỘC viết chú thích **JSDoc** cho mọi hàm exported.
+2. **Dự án Python (GPU Worker):**
+   - BẮT BUỘC viết test bằng **pytest**. Phải dùng kỹ thuật **Mocking** để giả lập GPU khi test luồng logic API, tránh gọi GPU thật gây tốn tiền.
+   - BẮT BUỘC khai báo Type Hinting (VD: `def run(audio: str) -> dict:`) và viết comment chuẩn **Docstring** cho mọi class/function.

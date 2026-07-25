@@ -1,0 +1,16 @@
+{
+  "name": "@dichomnion/crypto-utils",
+  "version": "1.0.0",
+  "description": "ECDSA and HMAC Security Utils for OmniVoice",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@dichomnion/shared-types": "workspace:*",
+    "typescript": "^5.0.0",
+    "vitest": "^1.0.0"
+  }
+}

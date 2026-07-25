@@ -1,0 +1,30 @@
+name = "dichomnion-gateway"
+main = "src/index.ts"
+compatibility_date = "2023-12-01"
+
+# KV: rate-limit đăng ký, idempotency job, trạng thái job/kết quả, và cờ kill switch.
+[[kv_namespaces]]
+binding = "KV_CACHE"
+id = "local-kv-id-for-dev"
+
+# --- Biến cấu hình công khai (đặt trong [vars] hoặc Dashboard) ---------------
+[vars]
+# URL của GPU worker riêng (chỉ Gateway gọi tới). Worker chỉ bind 127.0.0.1.
+WORKER_URL = "http://127.0.0.1:8000"
+# Danh sách origin client được phép (CORS). KHÔNG dùng "*".
+ALLOWED_ORIGINS = "tauri://localhost,https://tauri.localhost,http://localhost:1420,http://localhost:5173"
+# Ngưỡng thời gian Trạm 3 (tùy chọn, có mặc định trong code):
+# MIN_PLAUSIBLE_MS = "2000"
+# MAX_RENDER_MS = "900000"
+
+# --- SECRETS (KHÔNG commit — nạp bằng: wrangler secret put <TÊN>) ------------
+# GATEWAY_JWT_PRIVATE_KEY : PKCS8 PEM khóa RIÊNG ES256 (P-256) của Gateway.
+#                           Worker chỉ giữ khóa CÔNG KHAI tương ứng (Trạm 2).
+#                           Sinh khóa:
+#                             openssl ecparam -genkey -name prime256v1 -noout -out ec_priv.pem
+#                             openssl pkcs8 -topk8 -nocrypt -in ec_priv.pem -out gateway_pkcs8.pem
+#                             openssl ec -in ec_priv.pem -pubout -out gateway_pub_spki.pem
+#                           (public SPKI PEM -> đặt vào GATEWAY_JWT_PUBLIC_KEY của worker)
+# TURNSTILE_SECRET        : Secret key Cloudflare Turnstile (chống bot khi đăng ký).
+# ADMIN_TOKEN             : Bí mật chia sẻ cho watchdog Financial Kill Switch
+#                           (scripts/kill-switch-monitor.mjs) gọi /api/admin/kill-switch.
