@@ -5,7 +5,14 @@
 # LƯU Ý torch/torchaudio: bản pin dưới đây là build CUDA (cu126) dùng cho
 # GPU Model Residence (Trạm/Station GPU). Trên máy có GPU, cài từ index CUDA:
 #   pip install torch==2.13.0 torchaudio==2.11.0 --index-url https://download.pytorch.org/whl/cu126
-# Trên máy chỉ chạy test (CPU) có thể dùng bản CPU tương ứng cùng phiên bản.
+# CẶP NÀY ĐÃ KIỂM CHỨNG import cùng nhau trên build cu126 (hộp dev có GPU thật:
+# torch 2.13.0+cu126 + torchaudio 2.11.0+cu126, `import` sạch). Dòng phát hành torchaudio
+# ĐÃ TÁCH khỏi torch (torchaudio dừng quanh 2.11 trong khi torch tiến tới 2.13) nên chúng
+# KHÔNG cùng minor — pin đúng CẶP ĐÃ KIỂM, đừng ép cho khớp minor (ép = pin bản không tồn tại).
+# RESIDUAL_HARDWARE: khả năng có wheel cho CUDA đích + hành vi fp16/VRAM THẬT chỉ kiểm được
+# trên hộp 24GB mục tiêu (dev là GTX 1070 8GB, Pascal cc6.1 — KHÔNG fp16, không đủ để chạy
+# acceptance thật; xem docs/DEPLOYMENT.md §4 + CODE_REVIEW RH10). Trên máy CPU-only dùng bản
+# CPU cùng version. Nếu index không có cặp này, hạ về cặp torch/torchaudio CÙNG kênh phát hành.
 
 # --- API / web layer (src/main.py) ---
 fastapi==0.139.0
@@ -24,8 +31,13 @@ httpx==0.27.0
 # --- ASR: Faster-Whisper ghim VRAM (src/asr_service.py) ---
 faster-whisper==1.2.1
 
-# --- Dịch thuật LLM (src/translation_service.py: from openai import OpenAI) ---
-openai==2.48.0
+# --- Dịch thuật LLM CỤC BỘ thường trú VRAM (src/translation_service.py) ---
+# translation_service.py nạp Qwen bằng `from transformers import AutoModelForCausalLM`
+# (KHÔNG còn dùng openai/cloud — bản cũ rò rỉ transcript ra cloud, vi phạm Zero-Logging).
+# accelerate là BẮT BUỘC cho device_map="cuda" (transformers dùng accelerate để dispatch
+# trọng số lên GPU). Khớp với extra [local-llm] trong pyproject.toml.
+transformers>=4.51.0
+accelerate>=0.30.0
 
 # --- Tổng hợp giọng nói (src/tts_service.py: import edge_tts) ---
 edge-tts==7.2.8
@@ -33,7 +45,7 @@ edge-tts==7.2.8
 # --- Trộn/xử lý audio (src/audio_engine.py: pydub + torch/torchaudio) ---
 pydub==0.25.1
 torch==2.13.0
-torchaudio==2.11.0
+torchaudio==2.11.0   # dev-verified import cùng torch 2.13.0 trên cu126 (xem lưu ý đầu file)
 
 # --- Bộ TĂNG CƯỜNG (tùy chọn nhưng KHUYẾN NGHỊ) cho audio_engine.py ---
 # Demucs: tách nhạc nền (extract_instrumental, gọi qua CLI `demucs`).

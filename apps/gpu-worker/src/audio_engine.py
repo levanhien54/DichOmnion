@@ -1,5 +1,6 @@
 import os
 import tempfile
+import time
 import logging
 from typing import List, Dict, Any
 
@@ -104,9 +105,22 @@ class AudioEngine:
 
         try:
             # Chạy demucs. Mặc định demucs dùng model htdemucs, tách ra 4 stems.
-            # Lệnh: demucs -n htdemucs -o out_dir audio_path --two-stems vocals
+            # Lệnh: demucs -n htdemucs --two-stems vocals -d <device> --segment <n> -o out_dir audio_path
+            #
+            # -d cuda: ép Demucs tách nền TRÊN GPU. Không ép thì Demucs tự dò và có thể rơi
+            #   về CPU -> tách một clip mất hàng phút, dễ đụng trần MAX_RENDER_MS của Trạm 3
+            #   rồi bị quarantine oan (worker "chậm bất thường"). Worker vốn fail-closed nếu
+            #   không có CUDA (Qwen không nạp) nên mặc định 'cuda' là nhất quán; DEMUCS_DEVICE
+            #   cho phép ép 'cpu' khi cần.
+            # --segment 7: chặn TRẦN VRAM của Demucs. htdemucs xử theo cửa sổ; cửa sổ càng dài,
+            #   đỉnh VRAM càng cao. Trên một GPU 24GB đã cõng Whisper + Qwen 4B thường trú, một
+            #   đỉnh Demucs không giới hạn có thể OOM. 7s nằm trong giới hạn model htdemucs (~7.8s)
+            #   và giữ đỉnh bộ nhớ ổn định. DEMUCS_SEGMENT tinh chỉnh nếu cần.
+            device = os.environ.get("DEMUCS_DEVICE", "cuda")
+            segment = os.environ.get("DEMUCS_SEGMENT", "7")
             subprocess.run([
                 "demucs", "-n", "htdemucs", "--two-stems", "vocals",
+                "-d", device, "--segment", segment,
                 "-o", out_dir, audio_path
             ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
@@ -123,7 +137,9 @@ class AudioEngine:
             logger.error(f"Lỗi khi chạy Demucs (có thể chưa cài đặt?): {type(e).__name__}. CHƯA tách được nền.")
             return audio_path, False
 
-    def mix_audio(self, original_audio_path: str, tts_clips: List[Dict[str, Any]], ducking_db: float = -10.0) -> str:
+    # Default -5.0 khớp call-site production (model_manager.py truyền ducking_db=-5.0);
+    # giữ tường minh để default hàm không lệch với hành-vi thực-tế.
+    def mix_audio(self, original_audio_path: str, tts_clips: List[Dict[str, Any]], ducking_db: float = -5.0) -> str:
         """
         Trộn các file audio TTS vào audio gốc, thực hiện ducking (hạ âm lượng) 
         nền ở các thời điểm có TTS.
@@ -155,6 +171,7 @@ class AudioEngine:
             # Duyệt qua từng TTS clip
             stretched_count = 0
             truncated_count = 0
+            dropped_oor_count = 0
             for clip in tts_clips:
                 clip_path = clip.get("audio_path")
                 # Phòng thủ CC-1: chấp nhận cả số lẫn timecode chuỗi ("HH:MM:SS").
@@ -163,6 +180,22 @@ class AudioEngine:
                 start_ms = int(start_s * 1000)
 
                 if not clip_path or not os.path.exists(clip_path):
+                    continue
+
+                # NFS-MIX-OOR: pydub overlay(position=start_ms) ÂM THẦM bỏ clip khi
+                # start_ms >= len(bg_audio) (mốc bắt đầu nằm ngoài đuôi nhạc nền) — clip
+                # biến mất KHÔNG dấu vết nhưng model_manager vẫn báo "thành công" => đây là
+                # No-Fake-Success (người dùng mất tiếng lồng của đoạn đó mà không hề được báo).
+                # Mọi nhánh drop anh em (stretched/truncated/tts-fail/missing-translation) đều
+                # có ghi chú trung thực; nhánh này cũng phải có. Phát hiện SỚM (trước khi nạp/
+                # co-giãn để không đếm nhầm clip này vào stretched/truncated), bỏ SẠCH, đếm lại.
+                # bg_audio giữ nguyên độ dài suốt vòng lặp (before+during+after và overlay đều
+                # bảo toàn độ dài) nên so với len(bg_audio) là nhất quán mọi vòng.
+                if start_ms >= len(bg_audio):
+                    dropped_oor_count += 1
+                    logger.warning(
+                        "Clip TTS bắt đầu ngoài phạm vi nhạc nền — bỏ qua (đã ghi nhận trung thực)."
+                    )
                     continue
 
                 # Load TTS audio
@@ -209,6 +242,7 @@ class AudioEngine:
                 "clips": len(tts_clips),
                 "stretched": stretched_count,
                 "truncated": truncated_count,
+                "dropped_oor": dropped_oor_count,
             }
 
             # Xuất file hoàn chỉnh
@@ -289,5 +323,43 @@ class AudioEngine:
         except Exception as e:
             logger.error(f"Lỗi khi gài watermark: {type(e).__name__}. CHƯA gài được watermark.")
             return audio_path, False
+
+    def sweep_stale_finals(self, ttl_s: float, now: float | None = None) -> int:
+        """Đợt 17 F1 — dọn CƠ HỘI các file kết quả cuối (dubbed_audio) đã quá hạn.
+
+        process_job (LRC1) CỐ Ý giữ đầu ra cuối (*_final.wav / *_wm.wav) để client tải
+        về, nhưng KHÔNG có bước nào xóa nó sau đó -> mỗi job để lại một file trên đĩa
+        VĨNH VIỄN: (1) phình đĩa tới khi worker chết (khả dụng, tiêu chí #6/#4), (2) audio
+        LỒNG TIẾNG (nhạy cảm) nằm lại vô thời hạn (Zero-Logging #2). Client tải ngay sau
+        khi job DONE, nên một final cũ hơn TTL (mặc định 1h) coi như đã tải xong / bị bỏ
+        -> thu hồi an toàn. KHÔNG xóa-sau-khi-serve (sẽ phá retry tải lại) và KHÔNG chạy
+        reaper nền nặng nề — chỉ quét cơ hội ở đầu mỗi job.
+
+        Quét CHỈ hai hậu tố worker TỰ SINH bằng mkstemp (*_final.wav, *_wm.wav) trong
+        temp_dir, nên KHÔNG BAO GIỜ đụng audio nguồn / temp trung gian (_pre.wav/_fit.wav)
+        / file tiến trình khác. Best-effort tuyệt đối: nuốt mọi OSError (stat/xóa/liệt kê)
+        để một bước dọn rác KHÔNG BAO GIỜ làm hỏng job đang chạy. Trả số file đã xóa
+        (phục vụ test & quan sát). `now` cho phép test tiêm mốc thời gian tất định."""
+        if now is None:
+            now = time.time()
+        removed = 0
+        try:
+            entries = os.listdir(self.temp_dir)
+        except OSError:
+            return 0
+        for name in entries:
+            if not (name.endswith("_final.wav") or name.endswith("_wm.wav")):
+                continue
+            path = os.path.join(self.temp_dir, name)
+            try:
+                if not os.path.isfile(path):
+                    continue
+                if now - os.path.getmtime(path) > ttl_s:
+                    os.remove(path)
+                    removed += 1
+            except OSError:
+                # File biến mất giữa chừng / đang bị khóa / thiếu quyền — bỏ qua.
+                continue
+        return removed
 
 audio_engine = AudioEngine()

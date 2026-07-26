@@ -9,6 +9,10 @@ dependencies = [
     "uvicorn>=0.30.1",
     "torch>=2.3.1",
     "pydantic>=2.7.4",
+    # numpy: sàn phiên-bản TRANSITIVE có chủ-đích (phòng numpy-1.x xung-đột torch/faster-whisper),
+    # KHÔNG phải import trực-tiếp trong src/ → requirements.txt (chính-sách 1-import-1-package) đúng
+    # khi BỎ numpy. Đừng gỡ sàn này (có thể đổi phiên-bản numpy được resolve) và đừng thêm vào
+    # requirements.txt (vi-phạm header "mỗi gói = 1 import trực-tiếp").
     "numpy>=1.26.4",
     "PyJWT>=2.8.0",
     "cryptography>=42.0.0",
@@ -54,3 +58,11 @@ local-llm = [
 asyncio_mode = "auto"
 testpaths = ["tests"]
 pythonpath = ["."]
+# gpu_acceptance: bài kiểm THẬT trên GPU (cư trú VRAM, dịch Qwen, /process e2e) — CHỈ chạy
+# trên hộp GPU với RUN_GPU_ACCEPT=1 (conftest.py gác thêm bằng torch.cuda.is_available()).
+# addopts loại nhóm này khỏi lần chạy MẶC ĐỊNH -> suite CPU của dev vẫn xanh, KHÔNG giả
+# xanh phần chỉ GPU chứng minh được. Chạy trên box:  pytest -m gpu_acceptance  (ghi đè -m).
+markers = [
+    "gpu_acceptance: real-GPU acceptance test (opt-in; needs CUDA + weights). Deselected by default.",
+]
+addopts = "-m 'not gpu_acceptance'"

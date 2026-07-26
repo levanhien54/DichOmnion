@@ -1,0 +1,29 @@
+# Bối cảnh build chỉ cần requirements.txt + src/ (Dockerfile COPY đúng hai thứ này).
+# Loại phần nặng/không liên quan để build context nhẹ và không lọt bí mật vào ảnh.
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Test + fixtures không thuộc ảnh runtime.
+tests/
+
+# File media tạm (fixture/kết quả) — tuyệt đối không nhét vào ảnh.
+*.wav
+*.mp3
+*.mp4
+*.mkv
+*.mov
+
+# Bí mật: KHÔNG bao giờ đưa .env thật vào ảnh (chỉ .env.example được phép).
+.env
+.env.*
+!.env.example
+
+# Tài liệu / VCS.
+*.md
+.git/
+.gitignore

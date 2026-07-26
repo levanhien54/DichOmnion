@@ -28,6 +28,38 @@ fn temp_path(stem: &str, ext: &str) -> String {
     dir.to_string_lossy().into_owned()
 }
 
+/// TR-2 (dọn rác temp trên đường LỖI): các command dưới đây tạo `out_path` rồi có thể
+/// thoát sớm bằng `Err` (ffmpeg fail, đọc/ghi lỗi, file rỗng). Trên nhánh `Err`, `out_path`
+/// KHÔNG được trả về frontend nên webview KHÔNG thể gọi `cleanup_temp_file` để dọn — file
+/// rác (có thể là bản mp4/wav dở dang) nằm lại vĩnh viễn trong thư mục temp, phình đĩa qua
+/// nhiều lượt thất bại. Guard này xóa best-effort `out_path` khi rời scope (kể cả khi thoát
+/// bằng toán tử `?`), TRỪ khi đã `disarm()` trên nhánh thành công — khi đó `out_path` là đầu
+/// ra HỢP LỆ và phải được GIỮ lại. Đây là bản đối ứng phía client của bản vá LRC1 ở worker.
+struct TempFileGuard {
+    path: String,
+    armed: bool,
+}
+
+impl TempFileGuard {
+    fn new(path: &str) -> Self {
+        Self { path: path.to_string(), armed: true }
+    }
+
+    /// Nhả guard: nhánh THÀNH CÔNG gọi hàm này để GIỮ file (không xóa khi drop).
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            // Best-effort: file có thể chưa kịp được tạo (vd ffmpeg chưa chạy) — bỏ qua lỗi.
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
 /// TR-1 (chống path-traversal / đọc file tùy ý): chỉ cho phép thao tác trên file
 /// TẠM do CHÍNH app tạo ra — nằm trong thư mục temp của HĐH và mang tiền tố
 /// "omnivoice_". Nếu webview bị XSS, nó KHÔNG thể ép Rust đọc file bất kỳ (khóa
@@ -62,6 +94,8 @@ fn extract_audio(video_path: String) -> Result<AudioInfo, String> {
         return Err("File video không tồn tại hoặc không phải file hợp lệ".into());
     }
     let out_path = temp_path("audio", "wav");
+    // TR-2: dọn out_path trên MỌI đường thoát Err (frontend không nhận path để tự dọn).
+    let mut out_guard = TempFileGuard::new(&out_path);
 
     let output = Command::new_sidecar("ffmpeg")
         .map_err(|e| format!("Không nạp được ffmpeg sidecar: {e}"))?
@@ -94,6 +128,8 @@ fn extract_audio(video_path: String) -> Result<AudioInfo, String> {
     }
     let digest = md5::compute(&bytes);
 
+    // Thành công: out_path là audio hợp lệ — GIỮ lại cho bước upload/mux.
+    out_guard.disarm();
     Ok(AudioInfo {
         md5: format!("{:x}", digest),
         size_bytes: bytes.len() as u64,
@@ -114,6 +150,8 @@ fn mux_audio_to_video(video_path: String, audio_path: String) -> Result<String, 
         return Err("File audio không tồn tại hoặc không phải file hợp lệ".into());
     }
     let out_path = temp_path("dubbed", "mp4");
+    // TR-2: dọn out_path (mp4 dở dang) nếu mux thoát sớm bằng Err.
+    let mut out_guard = TempFileGuard::new(&out_path);
 
     let output = Command::new_sidecar("ffmpeg")
         .map_err(|e| format!("Không nạp được ffmpeg sidecar: {e}"))?
@@ -144,6 +182,8 @@ fn mux_audio_to_video(video_path: String, audio_path: String) -> Result<String, 
         return Err(format!("ffmpeg mux thất bại (mã {:?})", output.status.code()));
     }
 
+    // Thành công: out_path là video đã ghép — GIỮ để lưu ra Downloads.
+    out_guard.disarm();
     Ok(out_path)
 }
 
@@ -176,7 +216,11 @@ fn write_temp_audio(audio_b64: String) -> Result<String, String> {
         return Err("Audio tải về rỗng".into());
     }
     let out_path = temp_path("dubbed_dl", "wav");
+    // TR-2: nếu ghi lỗi giữa chừng (file rỗng/dở đã kịp tạo), dọn best-effort.
+    let mut out_guard = TempFileGuard::new(&out_path);
     std::fs::write(&out_path, &bytes).map_err(|e| format!("Không ghi được audio tạm: {e}"))?;
+    // Thành công: out_path chứa audio đã tải về — GIỮ cho bước mux cục bộ.
+    out_guard.disarm();
     Ok(out_path)
 }
 
@@ -355,6 +399,45 @@ mod tests {
         let outside = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
         let _ = cleanup_temp_file(outside.to_string());
         assert!(Path::new(outside).is_file(), "file ngoài temp KHÔNG được bị xóa");
+    }
+
+    #[test]
+    fn temp_guard_removes_file_on_drop_when_armed() {
+        // TR-2: guard còn "armed" (nhánh Err, chưa disarm) => xóa out_path khi rời scope.
+        let name = format!("omnivoice_guard_armed_{}.wav", unique_suffix());
+        let p = make_temp(&name);
+        assert!(p.exists());
+        {
+            let _g = TempFileGuard::new(p.to_str().unwrap());
+            // rời scope mà KHÔNG disarm (mô phỏng đường thoát Err) -> phải xóa.
+        }
+        assert!(!p.exists(), "guard còn armed phải xóa file khi drop");
+    }
+
+    #[test]
+    fn temp_guard_keeps_file_after_disarm() {
+        // Nhánh THÀNH CÔNG gọi disarm() => out_path (đầu ra hợp lệ) phải được GIỮ.
+        let name = format!("omnivoice_guard_disarm_{}.wav", unique_suffix());
+        let p = make_temp(&name);
+        assert!(p.exists());
+        {
+            let mut g = TempFileGuard::new(p.to_str().unwrap());
+            g.disarm();
+        }
+        assert!(p.exists(), "sau disarm phải GIỮ file (đầu ra hợp lệ)");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn temp_guard_drop_missing_file_is_noop() {
+        // Best-effort: file chưa từng được tạo (ffmpeg chưa chạy) => drop không panic.
+        let name = format!("omnivoice_guard_ghost_{}.wav", unique_suffix());
+        let mut p = std::env::temp_dir();
+        p.push(&name); // KHÔNG tạo file
+        {
+            let _g = TempFileGuard::new(p.to_str().unwrap());
+        }
+        assert!(!p.exists(), "file ma không được vô tình tạo ra");
     }
 
     #[test]

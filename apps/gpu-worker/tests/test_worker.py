@@ -1,3 +1,6 @@
+import os
+import tempfile
+
 import pytest
 from fastapi.testclient import TestClient
 from unittest.mock import patch, MagicMock
@@ -21,6 +24,21 @@ def mock_model_manager():
         yield mock_manager
 
 client = TestClient(app)
+
+def test_health_no_auth_and_zero_logging_shape():
+    """/health phải trả 200 mà KHÔNG cần JWT — Docker HEALTHCHECK và orchestrator
+    (RunPod/Modal) probe được TRƯỚC khi worker có khoá Gateway. Và chỉ lộ cờ boolean +
+    enum thiết bị: KHÔNG đường dẫn / model_id / token (Zero-Logging). Trên hộp dev
+    (không CUDA, lifespan không nạp model) -> models_loaded=False, device='cpu'."""
+    response = client.get("/health")
+    assert response.status_code == 200
+    data = response.json()
+    # Bất biến hình dạng: đúng 3 khoá vô hại, không hơn (chặn rò rỉ nội dung).
+    assert set(data.keys()) == {"status", "models_loaded", "device"}
+    assert data["status"] == "ok"
+    assert isinstance(data["models_loaded"], bool)
+    assert data["device"] in ("cuda", "cpu")
+
 
 def test_gpu_worker_process_endpoint(mock_model_manager):
     """
@@ -56,7 +74,7 @@ def test_gpu_worker_process_endpoint(mock_model_manager):
     mock_model_manager.process_job.assert_called_once_with(
         "http://fake-audio.wav",
         {"target_language": "Vietnamese", "style": "Formal", "segments": [],
-         "voice_map": {}, "source_language": None}
+         "voice_map": {}, "source_language": None, "audio_md5": ""}
     )
 
 
@@ -87,7 +105,7 @@ def test_worker_forwards_voice_map_and_source_language(mock_model_manager):
         "http://fake-audio.wav",
         {"target_language": "Vietnamese", "style": "Casual", "segments": [],
          "voice_map": {"SPEAKER_01": "vi-VN-NamMinhNeural", "SPEAKER_02": "vi-VN-HoaiMyNeural"},
-         "source_language": "en"},
+         "source_language": "en", "audio_md5": ""},
     )
 
 
@@ -163,3 +181,134 @@ def test_process_token_jobid_mismatch_rejected(mock_model_manager):
         mock_model_manager.process_job.assert_not_called()
     finally:
         app.dependency_overrides.clear()
+
+
+# ── /api/worker/download: chống directory traversal + ràng buộc loại file ─────────
+# Endpoint chỉ cho Gateway (JWT) tải file KẾT QUẢ nằm TRONG thư mục temp. Đây là bề mặt
+# tấn công đọc-file-tuỳ-ý nếu containment sai, nên bốn nhánh dưới phải được khoá bằng test.
+
+def _auth_gateway():
+    """Override JWT: coi như request đã có JWT Gateway hợp lệ (ta test logic đường dẫn,
+    KHÔNG test lại lớp xác thực — lớp đó đã có test riêng)."""
+    from src.main import verify_gateway_jwt
+    app.dependency_overrides[verify_gateway_jwt] = lambda: {"role": "gateway"}
+
+
+def test_download_traversal_outside_temp_rejected():
+    """403: đường dẫn thoát RA NGOÀI thư mục temp (../) bị chặn TRƯỚC khi chạm đĩa.
+    realpath phân giải '..' về thư mục cha của temp -> ngoài ranh giới -> Access Denied."""
+    _auth_gateway()
+    try:
+        evil = os.path.join(tempfile.gettempdir(), "..", "outside_secret.wav")
+        resp = client.get("/api/worker/download", params={"path": evil})
+        assert resp.status_code == 403
+        assert "temp" in resp.json()["detail"].lower()
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_download_bad_extension_rejected():
+    """403: file NẰM TRONG temp nhưng đuôi không thuộc {wav,mp3,mp4} bị từ chối — chặn
+    dùng endpoint để hút file tạm nhạy cảm khác (vd .env, .txt kịch bản) khỏi temp."""
+    _auth_gateway()
+    try:
+        p = os.path.join(tempfile.gettempdir(), "note.txt")
+        resp = client.get("/api/worker/download", params={"path": p})
+        assert resp.status_code == 403
+        assert "Invalid file type" in resp.json()["detail"]
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_download_missing_file_returns_404():
+    """404: đường dẫn hợp lệ (trong temp, đuôi .wav) nhưng file không tồn tại. Xác nhận
+    thứ tự kiểm: containment + đuôi PASS rồi mới tới tồn-tại (không lộ nhầm 403/404)."""
+    _auth_gateway()
+    try:
+        p = os.path.join(tempfile.gettempdir(), "khong_ton_tai_abc123.wav")
+        if os.path.exists(p):
+            os.remove(p)
+        resp = client.get("/api/worker/download", params={"path": p})
+        assert resp.status_code == 404
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_download_valid_temp_wav_succeeds():
+    """200: file .wav THẬT trong temp được trả về nguyên vẹn với media_type audio/wav.
+    Đây là đường hạnh phúc Gateway dùng để proxy kết quả cho client."""
+    _auth_gateway()
+    fd, path = tempfile.mkstemp(suffix=".wav")
+    try:
+        payload = b"RIFF....WAVEfmt fake-wav-bytes"
+        with os.fdopen(fd, "wb") as f:
+            f.write(payload)
+        resp = client.get("/api/worker/download", params={"path": path})
+        assert resp.status_code == 200
+        assert resp.content == payload
+        assert resp.headers["content-type"].startswith("audio/wav")
+    finally:
+        app.dependency_overrides.clear()
+        if os.path.exists(path):
+            os.remove(path)
+
+
+def test_download_without_jwt_rejected():
+    """Không có JWT Gateway -> HTTPBearer chặn (401/403) TRƯỚC mọi logic đường dẫn.
+    Không override verify_gateway_jwt để chuỗi phòng thủ thật chạy."""
+    resp = client.get("/api/worker/download", params={"path": "whatever.wav"})
+    assert resp.status_code in (401, 403)
+
+
+# ── /api/worker/upload: staging AUDIO nội bộ (chỉ Gateway) ────────────────────────
+# Chỉ nhận .wav/.mp3. Đây là điểm ghi-đĩa duy nhất từ mạng vào; ràng buộc đuôi phải test.
+
+def test_upload_bad_extension_rejected():
+    """400: filename không phải .wav/.mp3 (vd .txt) bị từ chối TRƯỚC khi ghi đĩa —
+    chặn đẩy payload tuỳ ý (vd script, thực thi) vào temp của worker."""
+    _auth_gateway()
+    try:
+        resp = client.post(
+            "/api/worker/upload",
+            files={"file": ("evil.txt", b"not audio", "text/plain")},
+        )
+        assert resp.status_code == 400
+        assert "Invalid audio format" in resp.json()["detail"]
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_upload_valid_wav_succeeds():
+    """200: .wav hợp lệ được lưu vào temp; trả audio_path nằm TRONG temp và file có
+    đúng nội dung đã upload. Dọn file tạm sau khi assert để không rác temp."""
+    _auth_gateway()
+    saved_path = None
+    try:
+        payload = b"RIFF....WAVEfmt staged-bytes"
+        resp = client.post(
+            "/api/worker/upload",
+            files={"file": ("clip.wav", payload, "audio/wav")},
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["status"] == "success"
+        saved_path = body["audio_path"]
+        # Đường dẫn phải nằm trong temp và trỏ tới file .wav vừa ghi đúng nội dung.
+        temp_real = os.path.realpath(tempfile.gettempdir())
+        assert os.path.realpath(saved_path).startswith(temp_real + os.sep)
+        assert saved_path.endswith(".wav")
+        with open(saved_path, "rb") as f:
+            assert f.read() == payload
+    finally:
+        app.dependency_overrides.clear()
+        if saved_path and os.path.exists(saved_path):
+            os.remove(saved_path)
+
+
+def test_upload_without_jwt_rejected():
+    """Không có JWT Gateway -> chặn (401/403) TRƯỚC khi ghi bất cứ byte nào vào đĩa."""
+    resp = client.post(
+        "/api/worker/upload",
+        files={"file": ("clip.wav", b"x", "audio/wav")},
+    )
+    assert resp.status_code in (401, 403)

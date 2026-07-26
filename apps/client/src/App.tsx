@@ -19,6 +19,7 @@ import {
 } from './lib/tauri';
 import { uploadAudioForWorker } from './lib/transport';
 import { savePrivateKey, loadPrivateKey } from './lib/keystore';
+import { timecodeToSeconds } from './timecode';
 
 const GATEWAY_URL = import.meta.env.VITE_GATEWAY_URL || 'http://localhost:8787';
 const TURNSTILE_SITE_KEY = import.meta.env.VITE_TURNSTILE_SITE_KEY;
@@ -36,24 +37,6 @@ const LANGUAGES: ReadonlyArray<{ value: string; label: string }> = [
   { value: 'Spanish', label: 'Tiếng Tây Ban Nha' },
   { value: 'German', label: 'Tiếng Đức' },
 ];
-
-/**
- * Quy mốc thời gian người dùng nhập ("HH:MM:SS", "MM:SS", "SS", hoặc số/thập phân
- * kiểu "1,5") về GIÂY (số thực) TRƯỚC KHI KÝ. Hợp đồng `ClientSegment.start/end`
- * là số giây; worker (translation_service tính duration, audio_engine căn mix) đọc
- * SỐ — nếu gửi thẳng chuỗi "HH:MM:SS", `float()` phía worker sẽ hỏng rồi rơi về
- * pacing mặc định sai (CC-1). Không parse được -> 0 (không đoán bừa). Logic này
- * phản chiếu 1-1 src/timecode.py phía worker để hai đầu nhất quán tuyệt đối.
- */
-export function timecodeToSeconds(tc: string): number {
-  const s = (tc ?? '').trim().replace(',', '.');
-  if (!s) return 0;
-  const direct = Number(s);
-  if (!Number.isNaN(direct)) return direct; // đã là số ("83", "1.5")
-  const parts = s.split(':').map((p) => Number(p));
-  if (parts.some((n) => Number.isNaN(n))) return 0; // rác -> 0
-  return parts.reduce((acc, n) => acc * 60 + n, 0);
-}
 
 // Trạng thái công việc đã kết thúc (do Gateway trả về khi poll). Không có trạng
 // thái "giả thành công" — client phản ánh đúng những gì server báo.
@@ -267,6 +250,12 @@ function App() {
   const handleSpeakerChange = (id: string, newSpeaker: string) => {
     setSubtitles((prev) => prev.map((s) => (s.id === id ? { ...s, speaker: newSpeaker } : s)));
   };
+  const handleStartChange = (id: string, newStart: string) => {
+    setSubtitles((prev) => prev.map((s) => (s.id === id ? { ...s, start: newStart } : s)));
+  };
+  const handleEndChange = (id: string, newEnd: string) => {
+    setSubtitles((prev) => prev.map((s) => (s.id === id ? { ...s, end: newEnd } : s)));
+  };
   const handleMappingChange = (speaker: string, voiceId: string) => {
     setMapping((prev) => ({ ...prev, [speaker]: voiceId }));
   };
@@ -311,14 +300,20 @@ function App() {
       // Người nói mặc định KẾ THỪA dòng trước (nhiều câu liền thường cùng một người);
       // dòng đầu -> SPEAKER_01. Ô người nói có thể sửa để tách thành nhiều giọng —
       // uniqueSpeakers/VoiceMapper tự cập nhật theo các tên duy nhất.
-      const lastSpeaker = prev.length > 0 ? prev[prev.length - 1].speaker : '';
+      const last = prev.length > 0 ? prev[prev.length - 1] : null;
+      const lastSpeaker = last ? last.speaker : '';
+      // Mốc BẮT ĐẦU kế thừa mốc KẾT THÚC dòng trước (thoại liên tiếp thường nối
+      // nhau) để người dùng chỉ phải chỉnh mốc kết thúc. Đặt end = start ngay từ
+      // đầu -> validation trong submitJob buộc phải nhập độ dài THẬT (end > start)
+      // trước khi ký; KHÔNG bịa sẵn thời lượng giả.
+      const startDefault = last ? last.end : '00:00:00';
       return [
         ...prev,
         {
           id: `seg-${Date.now()}-${prev.length}`,
           speaker: lastSpeaker || 'SPEAKER_01',
-          start: '00:00:00',
-          end: '00:00:00',
+          start: startDefault,
+          end: startDefault,
           text: '',
         },
       ];
@@ -397,6 +392,26 @@ function App() {
       return;
     }
 
+    // F3: mỗi câu thoại NHẬP TAY phải có mốc thời gian hợp lệ TRƯỚC KHI KÝ. Nếu không,
+    // timecodeToSeconds trả 0 cho cả start lẫn end (rác/bỏ trống -> 0) và worker
+    // (audio_engine) overlay MỌI clip tại position=start_ms=0 -> chồng toàn bộ giọng ở
+    // giây 0, đồng thời target_ms=(end-start)=0 tắt luôn căn lip-sync. Yêu cầu: start
+    // hữu hạn ≥ 0 và end > start (thời lượng dương thật). Không chặn thứ tự/chồng lấn:
+    // audio_engine overlay theo vị trí TUYỆT ĐỐI nên vẫn đúng khi nhập lệch thứ tự, còn
+    // thoại chồng tiếng là tình huống hợp lệ (hai người nói cùng lúc).
+    if (subtitles.length > 0) {
+      const invalid = subtitles.find((s) => {
+        const st = timecodeToSeconds(s.start);
+        const en = timecodeToSeconds(s.end);
+        return !Number.isFinite(st) || !Number.isFinite(en) || st < 0 || en <= st;
+      });
+      if (invalid) {
+        const label = (invalid.text.trim() || invalid.id).slice(0, 40);
+        setError(`Câu thoại “${label}” cần mốc thời gian hợp lệ: bắt đầu ≥ 0 và kết thúc > bắt đầu.`);
+        return;
+      }
+    }
+
     setStatus('UPLOADING_AUDIO');
     setError(null);
     try {
@@ -406,6 +421,12 @@ function App() {
       const payload: JobRequest = {
         jobId: `JOB-${Date.now()}`,
         videoAudioUrl: audioUrl,
+        // Ràng buộc TOÀN VẸN: ký kèm md5 của chính bytes audio vừa upload (tính cục bộ ở
+        // Rust). Vì presigned PUT URL chỉ trỏ MỘT object key dùng chung cho mọi job/bản
+        // build, một job khác (hoặc người dùng khác) có thể ghi đè object trước khi worker
+        // của job này tải; worker so md5 này với bytes tải-về và fail-closed khi lệch, nên
+        // không bao giờ lồng tiếng nhầm audio của người khác (chống rò rỉ chéo tenant).
+        videoAudioMd5: audioInfo.md5,
         config: { targetLanguage: targetLang, translationStyle: style, sourceLanguage: sourceLang },
         speakerMapping: mapping,
         timestamp: Date.now(),
@@ -718,7 +739,13 @@ function App() {
 
             {subtitles.length > 0 ? (
               <>
-                <SubtitleEditor subtitles={subtitles} onChange={handleSubtitleChange} onSpeakerChange={handleSpeakerChange} />
+                <SubtitleEditor
+                  subtitles={subtitles}
+                  onChange={handleSubtitleChange}
+                  onSpeakerChange={handleSpeakerChange}
+                  onStartChange={handleStartChange}
+                  onEndChange={handleEndChange}
+                />
                 <VoiceMapper speakers={uniqueSpeakers} mapping={mapping} onChange={handleMappingChange} />
               </>
             ) : (

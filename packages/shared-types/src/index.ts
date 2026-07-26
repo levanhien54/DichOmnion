@@ -64,6 +64,15 @@ export interface ClientSegment {
 export interface JobRequest {
   jobId: string;
   videoAudioUrl: string; // Presigned URL tới R2
+  // md5 (hex) của CHÍNH bytes audio đã upload, do client tính cục bộ (AudioInfo.md5) và
+  // KÝ kèm payload này. Đây là ràng buộc TOÀN VẸN NỘI DUNG: presigned PUT URL chỉ mã hoá
+  // đúng MỘT object key, nên mọi job (và mọi bản build phân phối) ghi/đọc CÙNG một object
+  // R2 — job sau ghi đè job trước. Nếu không ràng buộc, worker của job A có thể tải nhầm
+  // audio của job/người dùng B rồi lồng tiếng lên nội dung riêng tư của B (rò rỉ chéo
+  // tenant). Worker so md5 tải-về với giá trị ĐÃ KÝ này và fail-closed khi lệch — biến
+  // rò rỉ thành từ chối an toàn. (Khe còn lại: object key dùng chung là vấn đề KHẢ DỤNG,
+  // cần gateway cấp presigned URL theo từng job — xem CODE_REVIEW.)
+  videoAudioMd5: string;
   config: TranslationConfig;
   speakerMapping: Record<string, string>;
   timestamp: number;

@@ -10,6 +10,7 @@ function basePayload(overrides: Partial<JobRequest> = {}): JobRequest {
   return {
     jobId: 'JOB-STATION3',
     videoAudioUrl: 'https://r2.cloudflare.com/audio.wav',
+    videoAudioMd5: 'd41d8cd98f00b204e9800998ecf8427e',
     config: { targetLanguage: 'Vietnamese', translationStyle: 'Formal' },
     speakerMapping: { SPEAKER_01: 'Voice_Nam' },
     timestamp: Date.now(),
@@ -247,6 +248,44 @@ describe('Trạm 3 — Tự động thử lại khi worker chết tạm thời (
     expect(result.result.dubbed_audio).toBe('/tmp/x.wav');
   });
 
+  it('Ký JWT MỚI cho MỖI lần dispatch (không tái dùng token có thể hết hạn giữa các lần thử)', async () => {
+    const kv = new MemoryKV();
+    // Giữ public key để tự xác minh mỗi token gửi đi là chứng thư gateway hợp lệ.
+    const { publicKey, privateKey } = await jose.generateKeyPair('ES256', { extractable: true });
+    const pem = await jose.exportPKCS8(privateKey);
+    const env = retryEnv(pem, kv);
+
+    const processAuths: string[] = [];
+    let processCalls = 0;
+    vi.stubGlobal('fetch', vi.fn(async (url: string, init: any) => {
+      if (url.endsWith('/api/worker/process')) {
+        processCalls += 1;
+        processAuths.push(init?.headers?.Authorization || '');
+        if (processCalls < 2) return new Response('{"detail":"overloaded"}', { status: 503 }); // 5xx -> retry
+        await new Promise((r) => setTimeout(r, 40));
+        return new Response(
+          JSON.stringify({ job_id: 'JOB-STATION3', result: { dubbed_audio: '/tmp/x.wav' } }),
+          { status: 200 },
+        );
+      }
+      return new Response('{}', { status: 200 });
+    }));
+
+    await dispatchToWorker(env as any, basePayload(), 'job:DEV:JOB-STATION3');
+
+    expect(processCalls).toBe(2);
+    // Mỗi lần thử ký MỚI: hai token KHÁC nhau (không tái dùng token dispatch cũ có thể đã
+    // qua exp 2m). ECDSA ngẫu nhiên hóa chữ ký nên hai lần ký cho ra chuỗi khác nhau.
+    expect(processAuths[0]).not.toBe(processAuths[1]);
+    // Và cả hai đều tự xác minh được là chứng thư gateway hợp lệ cho ĐÚNG job.
+    for (const a of processAuths) {
+      expect(a.startsWith('Bearer ')).toBe(true);
+      const { payload } = await jose.jwtVerify(a.slice('Bearer '.length), publicKey);
+      expect(payload.role).toBe('gateway');
+      expect(payload.jobId).toBe('JOB-STATION3');
+    }
+  });
+
   it('Lỗi mạng thoáng qua (không phải abort): thử lại và thành công → DONE', async () => {
     const kv = new MemoryKV();
     const env = retryEnv(await gatewayPrivateKeyPem(), kv);
@@ -376,6 +415,23 @@ describe('Kết quả BẤT ĐỒNG BỘ — client lấy được output (devic
     expect(res.status).toBe(404);
   });
 
+  it('Poll DONE nhưng result:key CHƯA lan tới edge (KV skew across PoP) → trả FINALIZING (non-terminal) để client poll tiếp, KHÔNG chốt DONE cụt', async () => {
+    const kv = new MemoryKV();
+    // Trạng thái DONE đã thấy ở edge này, nhưng result key chưa propagate tới (eventual
+    // consistency giữa các PoP). Dispatch ghi result TRƯỚC DONE nên đây chỉ là skew đọc.
+    await kv.put('job:DEV:JOB-1', JSON.stringify({ status: 'DONE', elapsed: 4200, attempts: 1 }));
+    // Cố ý KHÔNG ghi result:DEV:JOB-1.
+
+    const res = await app.request('/api/jobs/JOB-1', { headers: { 'X-Device-Id': 'DEV' } }, { KV_CACHE: kv }, ctx);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    // KHÔNG được chốt DONE: client sẽ latch terminal + không có artifact = ngõ cụt.
+    expect(body.status).toBe('FINALIZING');
+    expect(body.status).not.toBe('DONE');
+    // Không có kết quả để trả trong cửa sổ propagate này.
+    expect(body.result).toBeUndefined();
+  });
+
   it('Download proxy: DONE → ký JWT gateway → proxy worker → stream audio về client', async () => {
     const kv = new MemoryKV();
     const pem = await gatewayPrivateKeyPem();
@@ -492,6 +548,61 @@ describe('Kill Switch tài chính (Financial Kill Switch)', () => {
     expect(await env.KV_CACHE.get('system:kill_switch')).toBe(null);
   });
 
+  it('Body HỎNG/thiếu cờ active (dù token đúng) → 400 và KHÔNG vô tình XÓA switch đang bật', async () => {
+    // Fail-closed: một request re-arm bị méo body TUYỆT ĐỐI không được ngầm tắt kill switch.
+    const env = { KV_CACHE: new MemoryKV(), ADMIN_TOKEN: 'admin-secret' };
+    await env.KV_CACHE.put('system:kill_switch', '1'); // switch đang BẬT (đang chặn chi tiêu)
+
+    const res = await app.request(
+      '/api/admin/kill-switch',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Admin-Token': 'admin-secret' },
+        body: 'khong-phai-json', // body hỏng -> parse ném -> null
+      },
+      env,
+      ctx,
+    );
+    expect(res.status).toBe(400);
+    // Switch vẫn BẬT: garbled body không được disarm safety tài chính.
+    expect(await env.KV_CACHE.get('system:kill_switch')).toBe('1');
+  });
+
+  it('active KHÔNG phải boolean (vd chuỗi "true") → 400, không đổi trạng thái switch', async () => {
+    const env = { KV_CACHE: new MemoryKV(), ADMIN_TOKEN: 'admin-secret' };
+    await env.KV_CACHE.put('system:kill_switch', '1');
+    const res = await app.request(
+      '/api/admin/kill-switch',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Admin-Token': 'admin-secret' },
+        body: JSON.stringify({ active: 'true' }), // chuỗi, không phải boolean
+      },
+      env,
+      ctx,
+    );
+    expect(res.status).toBe(400);
+    expect(await env.KV_CACHE.get('system:kill_switch')).toBe('1');
+  });
+
+  it('active:false TƯỜNG MINH → CLEARED (gỡ switch đúng chủ đích)', async () => {
+    const env = { KV_CACHE: new MemoryKV(), ADMIN_TOKEN: 'admin-secret' };
+    await env.KV_CACHE.put('system:kill_switch', '1');
+    const res = await app.request(
+      '/api/admin/kill-switch',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Admin-Token': 'admin-secret' },
+        body: JSON.stringify({ active: false }),
+      },
+      env,
+      ctx,
+    );
+    expect(res.status).toBe(200);
+    expect((await res.json()).killSwitch).toBe('CLEARED');
+    expect(await env.KV_CACHE.get('system:kill_switch')).toBe(null);
+  });
+
   it('Khi Kill Switch bật: register và jobs/create đều bị chặn 503', async () => {
     const env = { KV_CACHE: new MemoryKV(), ADMIN_TOKEN: 'admin-secret' };
 
@@ -523,5 +634,110 @@ describe('Kill Switch tài chính (Financial Kill Switch)', () => {
       ctx,
     );
     expect(job.status).toBe(503);
+  });
+});
+
+describe('Trạm 2 — dispatch FAIL-CLOSED khi thiếu/hỏng khóa ký gateway', () => {
+  it('Thiếu GATEWAY_JWT_PRIVATE_KEY → job FAILED(gateway_key_missing), TUYỆT ĐỐI không gọi worker', async () => {
+    const kv = new MemoryKV();
+    // Cố ý KHÔNG cấp khóa ký: worker chỉ giữ public key nên nếu gateway không ký được
+    // thì KHÔNG có cách nào chứng minh danh tính -> phải từ chối dispatch, không "chạy chui".
+    const env = { KV_CACHE: kv, WORKER_URL: 'http://127.0.0.1:8000' };
+
+    const fetchMock = vi.fn(async () => new Response('{}', { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await dispatchToWorker(env as any, basePayload(), 'job:DEV:JOB-STATION3');
+
+    // Không có JWT -> không bao giờ chạm worker (không tốn GPU, không lộ audio_url).
+    expect(fetchMock).not.toHaveBeenCalled();
+    const record = await kv.get('job:DEV:JOB-STATION3', { type: 'json' });
+    expect(record.status).toBe('FAILED');
+    expect(record.reason).toBe('gateway_key_missing');
+  });
+
+  it('PEM sai định dạng → job FAILED(gateway_key_invalid), không gọi worker', async () => {
+    const kv = new MemoryKV();
+    // Khóa có mặt nhưng KHÔNG parse được (import ném lỗi) -> signGatewayJwt trả null.
+    // Phân biệt với nhánh "thiếu khóa": reason phải là gateway_key_invalid, không phải missing.
+    const env = { KV_CACHE: kv, GATEWAY_JWT_PRIVATE_KEY: 'khong-phai-PEM-hop-le', WORKER_URL: 'http://127.0.0.1:8000' };
+
+    const fetchMock = vi.fn(async () => new Response('{}', { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await dispatchToWorker(env as any, basePayload(), 'job:DEV:JOB-STATION3');
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    const record = await kv.get('job:DEV:JOB-STATION3', { type: 'json' });
+    expect(record.status).toBe('FAILED');
+    expect(record.reason).toBe('gateway_key_invalid');
+  });
+});
+
+describe('Download proxy — nhánh lỗi FAIL-CLOSED (không lộ temp path nội bộ)', () => {
+  const SECRET = '/tmp/secret-leak.wav';
+
+  it('DONE nhưng result KHÔNG có dubbed_audio → 404, không lộ đường dẫn', async () => {
+    const kv = new MemoryKV();
+    await kv.put('job:DEV:JOB-1', JSON.stringify({ status: 'DONE' }));
+    // Bản ghi kết quả thiếu artifact (vd worker báo thành công nhưng không đính file).
+    await kv.put('result:DEV:JOB-1', JSON.stringify({ result: { distinct_voices: 1 } }));
+
+    const res = await app.request(
+      '/api/jobs/JOB-1/download',
+      { headers: { 'X-Device-Id': 'DEV' } },
+      { KV_CACHE: kv },
+      ctx,
+    );
+    expect(res.status).toBe(404);
+    expect((await res.json()).error).toBe('Result artifact unavailable');
+  });
+
+  it('DONE + có path nhưng gateway KHÔNG có khóa ký → 503, KHÔNG lộ temp path', async () => {
+    const kv = new MemoryKV();
+    await kv.put('job:DEV:JOB-1', JSON.stringify({ status: 'DONE' }));
+    await kv.put('result:DEV:JOB-1', JSON.stringify({ result: { dubbed_audio: SECRET } }));
+    // Không cấp GATEWAY_JWT_PRIVATE_KEY -> signGatewayJwt null -> 503 fail-closed.
+    const env = { KV_CACHE: kv, WORKER_URL: 'http://127.0.0.1:8000' };
+
+    const res = await app.request('/api/jobs/JOB-1/download', { headers: { 'X-Device-Id': 'DEV' } }, env, ctx);
+    expect(res.status).toBe(503);
+    expect((await res.json()).error).toBe('Gateway not provisioned to fetch result');
+  });
+
+  it('Worker không kết nối được (fetch ném lỗi) → 502, KHÔNG lộ temp path', async () => {
+    const kv = new MemoryKV();
+    const pem = await gatewayPrivateKeyPem();
+    await kv.put('job:DEV:JOB-1', JSON.stringify({ status: 'DONE' }));
+    await kv.put('result:DEV:JOB-1', JSON.stringify({ result: { dubbed_audio: SECRET } }));
+    const env = { KV_CACHE: kv, GATEWAY_JWT_PRIVATE_KEY: pem, WORKER_URL: 'http://127.0.0.1:8000' };
+
+    vi.stubGlobal('fetch', vi.fn(async () => { throw new TypeError('connection refused'); }));
+
+    const res = await app.request('/api/jobs/JOB-1/download', { headers: { 'X-Device-Id': 'DEV' } }, env, ctx);
+    expect(res.status).toBe(502);
+    const body = await res.json();
+    expect(body.error).toBe('Worker unreachable');
+    // Zero-Logging: đường dẫn temp nội bộ TUYỆT ĐỐI không rò rỉ trong response lỗi.
+    expect(JSON.stringify(body)).not.toContain('secret-leak');
+  });
+
+  it('Worker trả lỗi (không ok) → 502 kèm mã, KHÔNG lộ temp path', async () => {
+    const kv = new MemoryKV();
+    const pem = await gatewayPrivateKeyPem();
+    await kv.put('job:DEV:JOB-1', JSON.stringify({ status: 'DONE' }));
+    await kv.put('result:DEV:JOB-1', JSON.stringify({ result: { dubbed_audio: SECRET } }));
+    const env = { KV_CACHE: kv, GATEWAY_JWT_PRIVATE_KEY: pem, WORKER_URL: 'http://127.0.0.1:8000' };
+
+    // Worker từ chối (vd 403 do path không hợp lệ). Gateway KHÔNG chuyển tiếp mã lỗi thô
+    // mà quy về 502 + code, không lộ chi tiết nội bộ.
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('Access Denied', { status: 403 })));
+
+    const res = await app.request('/api/jobs/JOB-1/download', { headers: { 'X-Device-Id': 'DEV' } }, env, ctx);
+    expect(res.status).toBe(502);
+    const body = await res.json();
+    expect(body.error).toBe('Worker download failed');
+    expect(body.code).toBe(403);
+    expect(JSON.stringify(body)).not.toContain('secret-leak');
   });
 });

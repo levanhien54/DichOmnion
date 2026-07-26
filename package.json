@@ -11,7 +11,8 @@
     "build": "pnpm -r --filter=\"./packages/*\" run build",
     "test": "pnpm run test:ts && pnpm run test:py",
     "test:ts": "pnpm -r run test",
-    "test:py": "cd apps/gpu-worker && python -m pytest -q"
+    "test:py": "cd apps/gpu-worker && python -m pytest -q",
+    "test:py:gpu": "cd apps/gpu-worker && RUN_GPU_ACCEPT=1 python -m pytest -m gpu_acceptance -q"
   },
   "devDependencies": {
     "typescript": "^5.0.0",

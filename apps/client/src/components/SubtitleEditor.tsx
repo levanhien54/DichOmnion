@@ -13,9 +13,17 @@ interface SubtitleEditorProps {
   subtitles: Subtitle[];
   onChange: (id: string, newText: string) => void;
   onSpeakerChange: (id: string, newSpeaker: string) => void;
+  onStartChange: (id: string, newStart: string) => void;
+  onEndChange: (id: string, newEnd: string) => void;
 }
 
-export function SubtitleEditor({ subtitles, onChange, onSpeakerChange }: SubtitleEditorProps) {
+export function SubtitleEditor({
+  subtitles,
+  onChange,
+  onSpeakerChange,
+  onStartChange,
+  onEndChange,
+}: SubtitleEditorProps) {
   return (
     <div className="bg-card text-card-foreground border rounded-2xl p-6 shadow-sm w-full">
       <div className="flex items-center gap-3 mb-6 border-b pb-4">
@@ -29,7 +37,7 @@ export function SubtitleEditor({ subtitles, onChange, onSpeakerChange }: Subtitl
       <div className="space-y-4 max-h-[400px] overflow-y-auto pr-2 custom-scrollbar">
         {subtitles.map((sub) => (
           <div key={sub.id} className="flex gap-4 p-4 rounded-xl bg-background border hover:border-primary/50 transition-colors">
-            <div className="flex flex-col items-center justify-center gap-2 min-w-[96px]">
+            <div className="flex flex-col items-center justify-center gap-2 min-w-[120px]">
               <input
                 type="text"
                 value={sub.speaker}
@@ -38,10 +46,32 @@ export function SubtitleEditor({ subtitles, onChange, onSpeakerChange }: Subtitl
                 title="Sửa tên người nói — mỗi tên khác nhau sẽ được gán một giọng riêng ở bước dưới."
                 className="w-full px-2 py-1 bg-muted rounded-lg text-xs font-bold text-center text-muted-foreground border border-transparent focus:border-ring focus:bg-background outline-none transition-colors"
               />
-              <div className="flex items-center gap-1 text-[10px] text-muted-foreground font-mono">
-                <Clock className="w-3 h-3" />
-                {sub.start} - {sub.end}
+              {/* Mốc thời gian PHẢI nhập được: worker căn (overlay) mỗi câu tại đúng
+                  `start` và co/giãn theo (end-start). Không có ô này thì mọi câu kẹt ở
+                  00:00:00 -> chồng toàn bộ giọng ở giây 0. Chấp nhận HH:MM:SS / MM:SS /
+                  số giây (khớp timecodeToSeconds ở App + timecode.py ở worker). */}
+              <div className="flex items-center gap-1 text-[10px] text-muted-foreground w-full">
+                <Clock className="w-3 h-3 shrink-0" />
+                <span>Thời điểm (giây / HH:MM:SS)</span>
               </div>
+              <input
+                type="text"
+                value={sub.start}
+                onChange={(e) => onStartChange(sub.id, e.target.value)}
+                aria-label="Thời điểm bắt đầu"
+                title="Bắt đầu — HH:MM:SS, MM:SS, hoặc số giây (vd 00:00:05 hoặc 5)."
+                placeholder="bắt đầu"
+                className="w-full px-1.5 py-1 bg-muted rounded-md text-[11px] font-mono text-center border border-transparent focus:border-ring focus:bg-background outline-none transition-colors"
+              />
+              <input
+                type="text"
+                value={sub.end}
+                onChange={(e) => onEndChange(sub.id, e.target.value)}
+                aria-label="Thời điểm kết thúc"
+                title="Kết thúc — PHẢI lớn hơn mốc bắt đầu. HH:MM:SS, MM:SS, hoặc số giây."
+                placeholder="kết thúc"
+                className="w-full px-1.5 py-1 bg-muted rounded-md text-[11px] font-mono text-center border border-transparent focus:border-ring focus:bg-background outline-none transition-colors"
+              />
             </div>
             
             <div className="flex-1">

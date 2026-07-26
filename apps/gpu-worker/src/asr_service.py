@@ -35,8 +35,15 @@ class ASRService:
             ) from e
         except Exception as e:
             # Fail-closed: trọng số/model không nạp được thì để lỗi nổ ra,
-            # tuyệt đối không im lặng rồi chạy pipeline rỗng.
-            raise RuntimeError(f"Không thể nạp mô hình Whisper: {e}") from e
+            # tuyệt đối không im lặng rồi chạy pipeline rỗng. Zero-Logging: chỉ log
+            # TÊN loại lỗi và raise thông điệp TĨNH (không nhúng {e}) để str() của
+            # RuntimeError an toàn-theo-cấu-trúc với mọi caller bắt sau này — khớp
+            # quy ước nhánh ImportError phía trên, translation_service.load_model và
+            # transcribe(). `from e` vẫn giữ cause cho traceback boot của operator
+            # (fail-closed, không chứa nội dung user); đây là vệ-sinh-nhất-quán,
+            # KHÔNG phải khử rò rỉ traceback lúc khởi động.
+            logger.error(f"Nạp Whisper thất bại: {type(e).__name__}")
+            raise RuntimeError("Không thể nạp mô hình Whisper.") from e
             
     def transcribe(self, audio_path: str) -> List[Dict[str, Any]]:
         """

@@ -10,10 +10,10 @@
 Sau đợt kiểm toán và xử lý dứt điểm theo danh mục `CODE_REVIEW.md` ngày **25/07/2026**, kiến trúc dự án đạt chuyển biến lớn về chất lượng và độ vững chắc của các tầng logic.
 
 ### 1. Chỉ Số Khỏe Mạnh Của Nền Tảng (Baseline System Health)
-- **Tình trạng Kiểm thử (Industrial Testing Suite):** 🟢 **Đạt 100% (55 Automated Tests PASSED)**
-  - `gateway` (TypeScript/Vitest): 24 tests — Phủ toàn bộ Trạm 1 & Trạm 3, Auto-retry 5xx/network, Re-queue, 202 ETA, Proxy Download JWT, Anti-DDoS loadtest.
+- **Tình trạng Kiểm thử (Industrial Testing Suite):** 🟢 **100% suite tự-động PASS** (Vitest + Pytest + tsc + cargo — số-liệu CHUẨN ở bảng xanh `CODE_REVIEW.md`; snapshot Đợt 28 / 2026-07-26 dưới đây):
+  - `gateway` (TypeScript/Vitest): **120 tests** — Phủ toàn bộ Trạm 1 & Trạm 3; auto-retry **cùng một `WORKER_URL`** (tối đa 3 lần khi worker trả 5xx/rớt mạng — **KHÔNG** phải re-queue đa-worker; pool cấp worker MỚI là RH6 residual chưa có), 202 ETA, Proxy Download JWT, chống lạm-dụng/loadtest, và các trần đầu-vào two-layer 422/400 (F1–F13 + AMP-JOBID).
   - `crypto-utils` (TypeScript/Vitest): 8 tests — ECDSA P-256 WebCrypto, Non-extractable keys, Fail-closed `verifySignature`, Canonicalization an toàn.
-  - `gpu-worker` (Python/Pytest): 23 tests — Chuỗi Time-Stretching lip-sync `atempo`, phân định syllables, chuyển tiếp Ánh xạ Giọng (Voice Mapping), Kiểm trần hợp đồng JWT.
+  - `gpu-worker` (Python/Pytest): **228 passed** (1 skipped, 4 deselected) — Chuỗi Time-Stretching lip-sync `atempo`, phân định syllables, chuyển tiếp Ánh xạ Giọng (Voice Mapping), Kiểm trần hợp đồng JWT, bộ trần đầu-vào/Zero-Logging/honesty-notes; nhóm `gpu_acceptance` deselect mặc-định (chỉ chạy trên GPU box).
 - **Tình trạng Dịch & Build (Compile/TypeCheck):** 🟢 **Sạch 100%** (`cargo check` cho Tauri Rust và `tsc --noEmit` cho React Client đều về Exit Code 0).
 - **Vendor Sidecar:** 🟢 Đã tích hợp sẵn nhị phân `ffmpeg-x86_64-pc-windows-msvc.exe` bên trong bộ công cụ Tauri cho desktop Windows.
 - **Tiêu chuẩn "No-Fake-Success" (Cấm bịa đặt):** 🟢 Xóa bỏ triệt để mọi đoạn mã khai báo thành công giả lập (stub success) trên toàn hệ thống. Mọi mô đun từ từ chối nhận việc khi thiếu mô hình AI VRAM hoặc chưa cấu hình Store Blob Cloud R2/S3 (Fail-closed).

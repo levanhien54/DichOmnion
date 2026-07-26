@@ -7,6 +7,18 @@ import httpx
 logger = logging.getLogger("omnivoice.tts")
 logger.setLevel(logging.WARNING)
 
+
+def _cloud_tts_allowed() -> bool:
+    """Cổng opt-in cho TTS ĐÁM MÂY (edge-tts).
+
+    QUYỀN RIÊNG TƯ (Zero-Logging): edge-tts đọc văn bản qua dịch vụ đám mây của Microsoft,
+    nghĩa là VĂN BẢN ĐÃ DỊCH của người dùng bị gửi RA NGOÀI (exfiltration nội dung). Vì vậy
+    đường cloud này MẶC ĐỊNH TẮT (fail-closed); vận hành viên phải đặt tường minh
+    OMNIVOICE_ALLOW_CLOUD_TTS (chấp nhận đánh đổi riêng tư, ví dụ dev/test) mới bật.
+    Production giữ mọi thứ CỤC BỘ bằng GPT-SoVITS (voice='gpt-sovits')."""
+    return os.environ.get("OMNIVOICE_ALLOW_CLOUD_TTS", "").strip().lower() in ("1", "true", "yes", "on")
+
+
 class TTSService:
     def __init__(self):
         self.temp_dir = tempfile.gettempdir()
@@ -61,7 +73,20 @@ class TTSService:
                 # tên loại lỗi, đồng nhất với audio_service/audio_engine.
                 logger.error(f"Lỗi gọi GPT-SoVITS: {type(e).__name__}. Chuyển sang Edge-TTS fallback.")
         
-        # Fallback hoặc mặc định Edge-TTS
+        # Fallback hoặc mặc định Edge-TTS.
+        # CỔNG RIÊNG TƯ: nếu chưa được phép dùng cloud TTS thì FAIL-CLOSED NGAY — xoá file
+        # tạm .wav vừa tạo và trả "" để câu này coi như KHÔNG lồng được (process_job/mix sẽ
+        # báo trung thực số câu mất tiếng). TUYỆT ĐỐI không gọi edge-tts ở đây: không một ký
+        # tự bản dịch nào được gửi ra Microsoft cloud khi vận hành viên chưa opt-in.
+        if not _cloud_tts_allowed():
+            logger.warning(
+                "TTS đám mây (edge-tts) bị KHÓA mặc định vì riêng tư — không gửi văn bản ra "
+                "ngoài. Đặt OMNIVOICE_ALLOW_CLOUD_TTS=1 để bật (dev/test), hoặc dùng GPT-SoVITS cục bộ."
+            )
+            if os.path.exists(path):
+                os.remove(path)
+            return ""
+
         # Edge-tts chỉ hỗ trợ mp3
         if path.endswith(".wav"):
             os.remove(path)

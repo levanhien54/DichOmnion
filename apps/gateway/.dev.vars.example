@@ -1,0 +1,25 @@
+# apps/gateway/.dev.vars — MẪU (template). Copy file này → `.dev.vars` để chạy `wrangler dev`
+# cục bộ. `.dev.vars` đã bị .gitignore (dòng 24), file `.dev.vars.example` này thì KHÔNG bị
+# ignore nên được commit làm khuôn. Đây LÀ giá-trị PLACEHOLDER — TUYỆT ĐỐI không dán khoá thật
+# vào file này rồi commit.
+#
+# Định dạng: dotenv (wrangler đọc `.dev.vars` kiểu dotenv — `KEY=value`, một biến mỗi dòng).
+# Chỉ CẦN cho `pnpm run dev` (wrangler dev, cổng 8787). KHÔNG cần cho `pnpm run test` (vitest tự
+# inject key trong test). Boot vẫn chạy nếu thiếu, nhưng mọi đường có xác-thực sẽ FAIL-CLOSED
+# (`gateway_key_missing`) cho tới khi có `GATEWAY_JWT_PRIVATE_KEY`.
+# PRODUCTION KHÔNG dùng file này — nạp secret bằng `wrangler secret put <TÊN>` (docs/DEPLOYMENT.md §2.6).
+
+# Khoá RIÊNG ES256 (P-256, PKCS8 PEM) Gateway dùng KÝ JWT mỗi job (Trạm 2). Worker chỉ giữ khoá
+# CÔNG KHAI tương ứng. Sinh cả cặp bằng helper (in sẵn lệnh nạp cho mỗi bên):
+#   scripts/gen-gateway-keys.sh
+# Giữ xuống-dòng THẬT của PEM, bọc trong nháy kép:
+GATEWAY_JWT_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----
+<dán PKCS8 PEM khoá RIÊNG (dev) vào đây>
+-----END PRIVATE KEY-----"
+
+# Secret Cloudflare Turnstile (đi cặp với VITE_TURNSTILE_SITE_KEY của Client) — chống bot khi đăng ký.
+TURNSTILE_SECRET="<Turnstile secret key>"
+
+# Bí mật chia sẻ bảo vệ endpoint quản trị POST /api/admin/kill-switch (watchdog Financial Kill
+# Switch: apps/gateway/scripts/kill-switch-monitor.mjs gửi header X-Admin-Token trùng giá trị này).
+ADMIN_TOKEN="<shared secret cho kill-switch>"
