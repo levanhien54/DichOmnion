@@ -23,3 +23,20 @@ TURNSTILE_SECRET="<Turnstile secret key>"
 # Bí mật chia sẻ bảo vệ endpoint quản trị POST /api/admin/kill-switch (watchdog Financial Kill
 # Switch: apps/gateway/scripts/kill-switch-monitor.mjs gửi header X-Admin-Token trùng giá trị này).
 ADMIN_TOKEN="<shared secret cho kill-switch>"
+
+# --- R2 (object storage cho AUDIO) — cho POST /api/uploads/presign ------------------
+# Gateway KÝ presigned R2 URL mỗi job (Option A). Client gọi /api/uploads/presign, Gateway
+# ký một cặp PUT/GET (SigV4, WebCrypto) rồi trả về — Gateway CHỈ ký, KHÔNG trung chuyển bytes.
+# Thiếu bất kỳ biến BẮT BUỘC nào bên dưới → endpoint FAIL-CLOSED 503 (không bịa URL giả).
+# PRODUCTION: nạp bằng `wrangler secret put <TÊN>` (ACCESS_KEY/SECRET là BÍ MẬT — đừng commit).
+#   R2 → S3 API token: Cloudflare Dashboard → R2 → Manage R2 API Tokens → tạo token có
+#   quyền Object Read & Write trên bucket; lấy Access Key ID + Secret Access Key.
+R2_ACCOUNT_ID="385e2b411beb41a79d6b45477bc3f544"   # mã tài khoản Cloudflare → host <id>.r2.cloudflarestorage.com
+R2_BUCKET="sonsonjh"                                # tên bucket R2 chứa audio job
+R2_ACCESS_KEY_ID="<R2 S3 Access Key ID>"            # BÍ MẬT (dev có thể để placeholder)
+R2_SECRET_ACCESS_KEY="<R2 S3 Secret Access Key>"    # BÍ MẬT — TUYỆT ĐỐI không commit khoá thật
+# Tuỳ chọn (có mặc định an toàn trong code):
+#   R2_REGION           — mặc định 'auto' (R2). Chỉ đổi nếu nhà cung cấp yêu cầu.
+#   R2_PRESIGN_EXPIRES_S — hạn sống của URL ký (giây), mặc định 7200 (2h), tối đa 604800.
+#   PRESIGN_RATE_LIMIT   — số lần ký tối đa mỗi thiết bị trong cửa sổ, mặc định 60.
+#   PRESIGN_WINDOW_S     — độ dài cửa sổ throttle (giây), mặc định 3600.

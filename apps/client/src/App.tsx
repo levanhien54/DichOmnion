@@ -415,17 +415,29 @@ function App() {
     setStatus('UPLOADING_AUDIO');
     setError(null);
     try {
-      // Chỉ AUDIO rời máy (fail-closed nếu chưa cấu hình lưu trữ đối tượng).
-      const audioUrl = await uploadAudioForWorker(audioInfo.audio_path);
+      // jobId phải sinh TRƯỚC khi xin Gateway ký URL: nó quyết định object key duy nhất
+      // `audio/<deviceId>/<jobId>.wav`. CÙNG một jobId phải chạy suốt (mint → upload →
+      // tạo job) để presigned PUT trỏ đúng object mà worker của job này sẽ GET.
+      const newJobId = `JOB-${Date.now()}`;
+
+      // Chỉ AUDIO rời máy. Với MỖI job, Gateway ký một cặp URL presigned R2 riêng
+      // (fail-closed nếu R2 chưa cấu hình / bị throttle / kill-switch). transport ký payload
+      // bằng khóa non-extractable qua closure — private key không rời App.tsx.
+      const audioUrl = await uploadAudioForWorker({
+        audioPath: audioInfo.audio_path,
+        gatewayUrl: GATEWAY_URL,
+        deviceId,
+        jobId: newJobId,
+        signPayload: (p) => signPayloadWithKey(p, privateKeyRef.current!),
+      });
 
       const payload: JobRequest = {
-        jobId: `JOB-${Date.now()}`,
+        jobId: newJobId,
         videoAudioUrl: audioUrl,
         // Ràng buộc TOÀN VẸN: ký kèm md5 của chính bytes audio vừa upload (tính cục bộ ở
-        // Rust). Vì presigned PUT URL chỉ trỏ MỘT object key dùng chung cho mọi job/bản
-        // build, một job khác (hoặc người dùng khác) có thể ghi đè object trước khi worker
-        // của job này tải; worker so md5 này với bytes tải-về và fail-closed khi lệch, nên
-        // không bao giờ lồng tiếng nhầm audio của người khác (chống rò rỉ chéo tenant).
+        // Rust). Object key nay là DUY NHẤT theo (device, job) nên không còn nguy cơ job
+        // khác ghi đè; md5 vẫn giữ làm hàng rào toàn vẹn phòng khi bytes tải-về sai lệch —
+        // worker so md5 này với bytes tải-về và fail-closed khi lệch.
         videoAudioMd5: audioInfo.md5,
         config: { targetLanguage: targetLang, translationStyle: style, sourceLanguage: sourceLang },
         speakerMapping: mapping,

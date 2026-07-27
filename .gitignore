@@ -29,6 +29,10 @@ Thumbs.db
 .idea/
 .vscode/
 
+# Cloudflare Workers / wrangler local runtime state (miniflare KV, tmp bundles,
+# dev sessions) — regenerated on every `wrangler dev`; never commit.
+.wrangler/
+
 # Temp media artifacts (worker/client scratch)
 *.tmp
 dummy.mp4

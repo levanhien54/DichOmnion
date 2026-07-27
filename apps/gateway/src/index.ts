@@ -3,6 +3,18 @@ import { cors } from 'hono/cors';
 import * as jose from 'jose';
 import { verifySignature } from '@dichomnion/crypto-utils';
 import { JobRequest, deterministicStringify } from '@dichomnion/shared-types';
+import { mintJobAudioUrls, amzDate } from './r2presign';
+// Edge input-bound constants live in a SEPARATE module: a Worker entrypoint may only
+// export handlers/functions — a plain-value named export here fails workerd startup
+// (see limits.ts). Import (do NOT re-export) so index.ts exports only default + functions.
+import {
+  MAX_SEGMENTS,
+  MAX_SEGMENT_TEXT_CHARS,
+  MAX_TOTAL_TEXT_CHARS,
+  MAX_FREETEXT_CHARS,
+  MAX_SEGMENT_META_CHARS,
+  MAX_JOBID_CHARS,
+} from './limits';
 
 type Bindings = {
   KV_CACHE: KVNamespace;
@@ -24,6 +36,17 @@ type Bindings = {
   // Đợt 17 F5: per-device job-creation throttle (bounds GPU spend / KV writes).
   JOBS_RATE_LIMIT?: string;       // override max NEW jobs per device per window
   JOBS_WINDOW_S?: string;         // override the job-creation throttle window (s)
+  // Đợt 30 — R2 presign (Option A: Gateway mints a per-job upload/download URL
+  // pair so audio flows client→R2→worker and NEVER through the Gateway). The two
+  // *_KEY values are Wrangler secrets; the rest are plain vars.
+  R2_ACCOUNT_ID?: string;         // → host `${R2_ACCOUNT_ID}.r2.cloudflarestorage.com`
+  R2_BUCKET?: string;             // target R2 bucket
+  R2_ACCESS_KEY_ID?: string;      // R2 S3 access key id (secret)
+  R2_SECRET_ACCESS_KEY?: string;  // R2 S3 secret access key (secret)
+  R2_REGION?: string;             // S3 region label; R2 uses 'auto' (default)
+  R2_PRESIGN_EXPIRES_S?: string;  // presigned URL lifetime (default 7200s = 2h)
+  PRESIGN_RATE_LIMIT?: string;    // override max mints per device per window
+  PRESIGN_WINDOW_S?: string;      // override the mint-throttle window (s)
 };
 
 // ---- Security / anti-fraud tuning -----------------------------------------
@@ -37,6 +60,15 @@ const REGISTER_WINDOW_S = 3_600;          // registration rate-limit window (1h)
 const JOBS_RATE_LIMIT = 60;               // max NEW jobs per device per window
 const JOBS_WINDOW_S = 3_600;              // job-creation throttle window (1h)
 const JOB_TTL_S = 86_400;                 // job/result records live 24h
+// Đợt 30 — R2 presign defaults. The URL must outlive upload + queue wait + the
+// worker's fetch; 2h is generous yet well under JOB_TTL_S. Integrity is bound by
+// the signed videoAudioMd5 the worker verifies, so a moderate window is safe.
+const PRESIGN_EXPIRES_S = 7_200;          // default presigned URL lifetime (2h)
+// A registered-but-untrusted device (Zero-Trust) could otherwise mint unlimited
+// upload URLs and PUT unlimited R2 objects (storage Denial-of-Wallet) WITHOUT
+// ever creating a job. Bound mints per device independently of JOBS_RATE_LIMIT.
+const PRESIGN_RATE_LIMIT = 60;            // max mints per device per window
+const PRESIGN_WINDOW_S = 3_600;           // mint-throttle window (1h)
 // ETA hint for the client poller: base overhead (download + model warmup + mix)
 // plus a coarse per-segment translate/TTS cost. This is an ESTIMATE surfaced in the
 // 202 accept and echoed by polling — NOT a guarantee. Real timing is enforced by
@@ -54,24 +86,9 @@ const PER_SEGMENT_MIN_MS = 150;           // scale the floor with real work to d
 const MAX_PLAUSIBLE_MS = 15 * 60_000;     // hard timeout -> terminate worker
 const KILL_SWITCH_KEY = 'system:kill_switch';
 
-// Đợt 17 F3/F4 — bound job input at the EDGE (defense-in-depth mirror of the
-// worker's pydantic gate). An untrusted-but-registered device (Zero-Trust: ALL
-// registered devices are untrusted) can sign a valid payload with a huge `segments`
-// array (count or per-segment text). The worker folds ALL segments into ONE Qwen
-// prompt then tokenizes + generates once -> VRAM OOM or a hang past MAX_PLAUSIBLE_MS
-// -> Station 3 quarantines the (globally URL-keyed) worker for 24h -> one bad device
-// DoSes EVERY tenant. Refusing here with a fast 400 turns "hang the cluster" into
-// "one rejected request" without ever touching the worker or the quarantine machinery.
-export const MAX_SEGMENTS = 2_000;               // max approved segments per job
-export const MAX_SEGMENT_TEXT_CHARS = 2_000;     // max chars in a single segment's text
-export const MAX_TOTAL_TEXT_CHARS = 200_000;     // max chars summed across all segments
-export const MAX_FREETEXT_CHARS = 200;           // target/style/source language free-text cap
-// Đợt 18 F6: the worker also embeds each segment's `id` and `speaker`/`speaker_id` into the
-// single Qwen prompt (translation_service builds them into model_inputs), yet the Đợt-17
-// bound measured only `text`. A signed payload with a tiny `text` but a giant `id`/`speaker`
-// slips both edges, bloats the prompt, and OOMs/hangs the worker -> 24h cross-tenant
-// quarantine. Bound each id/speaker string AND count it toward the same total budget.
-export const MAX_SEGMENT_META_CHARS = 256;       // max chars in a segment's id or speaker label
+// Edge input-bound constants (MAX_SEGMENTS, MAX_SEGMENT_TEXT_CHARS, MAX_TOTAL_TEXT_CHARS,
+// MAX_FREETEXT_CHARS, MAX_SEGMENT_META_CHARS) are imported from ./limits above — see that
+// module for the full Đợt 17 F3/F4 + Đợt 18 F6 rationale and why they cannot be exported here.
 
 const app = new Hono<{ Bindings: Bindings }>();
 
@@ -527,6 +544,112 @@ app.post('/api/jobs/create', async (c) => {
     { message: 'Job Accepted securely!', jobId: payloadObj.jobId, status: 'QUEUED', etaSeconds },
     202,
   );
+});
+
+// --- Per-job R2 upload URL minting (Đợt 30 — Option A) ----------------------
+// The client asks the Gateway for a short-lived presigned PUT (to upload the
+// extracted audio straight to R2) plus a presigned GET (for the GPU worker to
+// fetch it back). The audio bytes NEVER traverse the Gateway (Zero-Logging /
+// Zero-Trust). Auth mirrors /api/jobs/create exactly: only a registered device
+// with a valid ECDSA signature over { jobId, timestamp } may mint, and the
+// object key is namespaced by (device, job) so a minted URL can only ever
+// address its own job's object — never another device's or another job's.
+app.post('/api/uploads/presign', async (c) => {
+  if (await isKillSwitchActive(c.env)) {
+    return c.json({ error: 'Service temporarily unavailable (Kill Switch active)' }, 503);
+  }
+
+  const signature = c.req.header('X-ECDSA-Signature');
+  const deviceId = c.req.header('X-Device-Id');
+  if (!signature || !deviceId) {
+    return c.json({ error: 'Missing Zero-Trust Signature or Device ID' }, 401);
+  }
+
+  // Never trust the header key — look the public key up in the registry.
+  const publicKeyJwk = await c.env.KV_CACHE.get<JsonWebKey>(`device:${deviceId}`, { type: 'json' });
+  if (!publicKeyJwk) {
+    return c.json({ error: 'Unauthorized Device. Public Key not found in Registry.' }, 401);
+  }
+
+  const rawBody = await c.req.text();
+  let reqObj: { jobId?: unknown; timestamp?: unknown };
+  try {
+    reqObj = JSON.parse(rawBody);
+  } catch {
+    return c.json({ error: 'Invalid JSON' }, 400);
+  }
+
+  // Verify the ECDSA signature over the deterministic serialization.
+  const payloadStr = deterministicStringify(reqObj as Record<string, unknown>);
+  const isValid = await verifySignature(payloadStr, signature, publicKeyJwk);
+  if (!isValid) {
+    return c.json({ error: 'Tampering Detected. Signature Invalid.' }, 403);
+  }
+
+  // Replay protection — identical NaN-safe window to job creation.
+  const ts = reqObj.timestamp;
+  if (typeof ts !== 'number' || !Number.isFinite(ts) || Math.abs(Date.now() - ts) > REPLAY_WINDOW_MS) {
+    return c.json({ error: 'Request Expired. Replay attack prevented.' }, 403);
+  }
+
+  const jobId = reqObj.jobId;
+  if (!jobId || typeof jobId !== 'string') {
+    return c.json({ error: 'Missing jobId' }, 400);
+  }
+  // Đợt 32 F-R2-01 — UNLIKE job creation (where jobId is a FLAT KV key `job:<dev>:<id>`,
+  // so '/' and '.' are inert), here jobId is interpolated into a HIERARCHICAL R2 object key
+  // `audio/<deviceId>/<jobId>.wav` and thence into the SigV4 canonical URI path (r2presign
+  // keeps '/' literal and treats '.' as unreserved). A '/' reshapes the key — silently
+  // breaking the one-key-per-job invariant asserted above — and a '/../' or '/./' dot-segment
+  // survives into the SIGNED path yet the WHATWG URL parser normalises it away on the wire, so
+  // R2 answers SignatureDoesNotMatch even though we already returned 200 (No-Fake-Success).
+  // Bound jobId to a URL-path-safe allowlist; the only client ever mints `JOB-<epoch_ms>`.
+  // This allowlist strictly subsumes the lone-surrogate gate used at job creation.
+  if (!/^[A-Za-z0-9_-]+$/.test(jobId) || jobId.length > MAX_JOBID_CHARS) {
+    return c.json({ error: 'jobId has invalid characters' }, 400);
+  }
+
+  // Fail closed if R2 is not fully provisioned — never hand back a URL that
+  // points nowhere (No-Fake-Success). All four fields are required to sign.
+  const { R2_ACCOUNT_ID, R2_BUCKET, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY } = c.env;
+  if (!R2_ACCOUNT_ID || !R2_BUCKET || !R2_ACCESS_KEY_ID || !R2_SECRET_ACCESS_KEY) {
+    return c.json({ error: 'Upload storage not provisioned' }, 503);
+  }
+
+  // Per-device mint throttle (bounds R2 object creation independently of the
+  // job-creation throttle). Checked AFTER provisioning so a misconfigured
+  // deployment never silently burns a device's quota.
+  const presignLimit = Number(c.env.PRESIGN_RATE_LIMIT) || PRESIGN_RATE_LIMIT;
+  const presignWindow = Number(c.env.PRESIGN_WINDOW_S) || PRESIGN_WINDOW_S;
+  const rlKey = `rl:presign:${deviceId}`;
+  const rlCount = parseInt((await c.env.KV_CACHE.get(rlKey)) || '0', 10);
+  if (rlCount >= presignLimit) {
+    return c.json({ error: 'Too Many Upload Requests. Rate limit exceeded; please try again later.' }, 429);
+  }
+  await c.env.KV_CACHE.put(rlKey, String(rlCount + 1), { expirationTtl: presignWindow });
+
+  const expiresSeconds = Number(c.env.R2_PRESIGN_EXPIRES_S) || PRESIGN_EXPIRES_S;
+
+  try {
+    const urls = await mintJobAudioUrls({
+      config: {
+        accountId: R2_ACCOUNT_ID,
+        bucket: R2_BUCKET,
+        accessKeyId: R2_ACCESS_KEY_ID,
+        secretAccessKey: R2_SECRET_ACCESS_KEY,
+        region: c.env.R2_REGION,
+      },
+      deviceId,
+      jobId,
+      amzDate: amzDate(new Date()),
+      expiresSeconds,
+    });
+    return c.json(urls, 200);
+  } catch {
+    // Only reached on misconfigured expiry / signing failure — fail closed
+    // without leaking internals (Zero-Logging).
+    return c.json({ error: 'Upload storage misconfigured' }, 503);
+  }
 });
 
 // --- Job status polling (client-facing) ------------------------------------

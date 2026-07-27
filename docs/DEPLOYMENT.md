@@ -109,8 +109,15 @@ wrangler kv namespace create KV_CACHE          # dán id trả về vào wrangle
 wrangler secret put GATEWAY_JWT_PRIVATE_KEY     # dán PRIVATE PEM từ bước 1
 wrangler secret put TURNSTILE_SECRET
 wrangler secret put ADMIN_TOKEN
+# R2 (audio object storage) — Option A "Gateway ký URL mỗi job" (Đợt 30). R2_ACCOUNT_ID/R2_BUCKET
+# KHÔNG bí mật, đã mở sẵn trong [vars] của wrangler.toml. 2 secret dưới đây BẮT BUỘC — thiếu bất
+# kỳ cái nào thì POST /api/uploads/presign FAIL-CLOSED 503 và KHÔNG job nào upload được audio:
+wrangler secret put R2_ACCESS_KEY_ID            # Access Key ID của R2 S3 API token (Object R&W)
+wrangler secret put R2_SECRET_ACCESS_KEY        # Secret Access Key tương ứng
 # Đặt WORKER_URL = URL tunnel ở bước 2.5 (sửa [vars] trong wrangler.toml hoặc Dashboard).
 pnpm run deploy                                 # wrangler deploy --minify src/index.ts
+# Bật CORS cho bucket R2 (nếu chưa) để webview Tauri PUT presigned qua được — xem §5.1:
+wrangler r2 bucket cors put sonsonjh --file r2-cors.json   # hoặc dán r2-cors.json ở Dashboard
 ```
 
 ### 2.7 Probe (bắt buộc trước khi tin là "đã deploy")
@@ -159,6 +166,7 @@ số nằm sẵn trên hộp GPU, không đồng bộ từ máy dev.
 | Độ trễ cold-start < `--start-period` (300s) | thời gian `/health` chuyển 200 |
 | Demucs `-d cuda --segment 7` không OOM | `nvidia-smi` lúc tách nền |
 | Tunnel + KV + secret + `wrangler deploy` | thao tác live, phản hồi thật của Cloudflare |
+| R2 presign round-trip THẬT (Option A) | client PUT → worker GET với key thật + CORS preflight + md5 khớp; R2 nhận đúng SigV4 (UNSIGNED-PAYLOAD, SignedHeaders=host) — chỉ chứng minh được với R2 access key/secret thật + bucket đã bật CORS |
 
 ---
 
@@ -166,20 +174,23 @@ số nằm sẵn trên hộp GPU, không đồng bộ từ máy dev.
 
 - **Worker:** `apps/gpu-worker/.env.example` (đã liệt kê đầy đủ, kèm giải thích từng biến).
 - **Gateway:** `apps/gateway/wrangler.toml` (`[vars]` + danh sách secret cần `wrangler secret put`).
-- **Client (Tauri):** `apps/client/.env.example` — 4 biến `VITE_*` **nhúng lúc build**
+- **Client (Tauri):** `apps/client/.env.example` — **2** biến `VITE_*` **nhúng lúc build**
   (đổi giá trị phải build lại): `VITE_GATEWAY_URL` (URL Worker Gateway đã deploy; bỏ trống →
-  fallback `http://localhost:8787`), `VITE_TURNSTILE_SITE_KEY` (site key công khai, đi cặp
-  với secret `TURNSTILE_SECRET` của Gateway), và `VITE_AUDIO_UPLOAD_URL` +
-  `VITE_AUDIO_PUBLIC_URL` (presigned PUT + public GET của bucket R2/S3 — **R2 nằm hoàn
-  toàn phía Client, Gateway không bind R2**; thiếu 2 biến này → Client fail-closed, không
-  job nào chạy).
+  fallback `http://localhost:8787`) và `VITE_TURNSTILE_SITE_KEY` (site key công khai, đi cặp
+  với secret `TURNSTILE_SECRET` của Gateway). **Không còn biến R2 nào ở Client** — theo Option A
+  "Gateway ký URL mỗi job" (Đợt 30), mỗi job Client gọi `POST ${VITE_GATEWAY_URL}/api/uploads/presign`
+  để Gateway ký cặp presigned R2 (PUT upload + GET để worker tải về, key duy nhất
+  `audio/<deviceId>/<jobId>.wav`); Client PUT thẳng lên R2, Gateway CHỈ ký URL, không trung
+  chuyển bytes. Cấu hình R2 nằm ở **Gateway** (secret/vars — xem §2.6 + `apps/gateway/.dev.vars.example`).
 
 ### 5.1. Deploy Client (chân thứ 3, ngoài Worker + Gateway)
-1. `cp apps/client/.env.example apps/client/.env` rồi điền 4 biến ở trên (ít nhất
-   `VITE_GATEWAY_URL` + cặp AUDIO_UPLOAD/PUBLIC cho production).
+1. `cp apps/client/.env.example apps/client/.env` rồi điền `VITE_GATEWAY_URL` (production) +
+   `VITE_TURNSTILE_SITE_KEY` nếu bật Turnstile.
 2. Build: `cd apps/client && pnpm tauri build` (hoặc `pnpm tauri dev` để test — vẫn cần `.env`).
-3. Bucket R2/S3 phải bật CORS cho origin Tauri (`tauri://localhost`,
-   `https://tauri.localhost`) thì PUT presigned mới qua được.
+3. Bucket R2 phải bật CORS cho origin Tauri (`tauri://localhost`, `https://tauri.localhost`)
+   thì PUT presigned từ webview mới qua được — dùng `apps/gateway/r2-cors.json`
+   (`wrangler r2 bucket cors put sonsonjh --file r2-cors.json`, hoặc dán ở Dashboard →
+   R2 → bucket → Settings → CORS Policy).
 
 > **Tùy chọn — Financial Kill Switch:** Gateway expose endpoint quản trị
 > `POST /api/admin/kill-switch`, chỉ nhận request kèm header `X-Admin-Token` khớp secret

@@ -81,17 +81,19 @@ Worker **không bao giờ** lộ IP công khai — cloudflared tunnel là ingres
    `WORKER_URL` của Gateway (§1.1 bước 4) rồi `wrangler deploy` lại.
 
 ### 1.3. Khối Client (Tauri — build lại trỏ về Production)
-Client bóc tách audio cục bộ (ffmpeg sidecar), ký ECDSA, PUT audio thẳng lên R2/S3
-(presigned URL phía Client), rồi gửi URL công khai cho Gateway. **Biến `VITE_*` được nhúng
-lúc build** — đổi giá trị PHẢI build lại (xem `apps/client/.env.example`).
+Client bóc tách audio cục bộ (ffmpeg sidecar), ký ECDSA, xin Gateway ký presigned URL cho
+MỖI job (`POST /api/uploads/presign`, Option A — Đợt 30), PUT audio thẳng lên R2 rồi gửi
+presigned GET cho Gateway. **Biến `VITE_*` được nhúng lúc build** — đổi giá trị PHẢI build
+lại (xem `apps/client/.env.example`).
 
-1. Sao chép `apps/client/.env.example` → `apps/client/.env` và điền:
+1. Sao chép `apps/client/.env.example` → `apps/client/.env` và điền (**2 biến**, không còn
+   biến R2 nào ở Client — R2 nằm ở Gateway):
    - `VITE_GATEWAY_URL` = URL Gateway Production (§1.1). Bỏ trống → fallback
      `http://localhost:8787` (chỉ hợp cho dev).
    - `VITE_TURNSTILE_SITE_KEY` = site key Turnstile (cặp với `TURNSTILE_SECRET` Gateway).
-   - `VITE_AUDIO_UPLOAD_URL` / `VITE_AUDIO_PUBLIC_URL` = presigned PUT + public GET của
-     bucket R2/S3. **Thiếu 2 biến này → Client ném lỗi, không job nào chạy được**
-     (No-Fake-Success: không bịa URL giả).
+   - *Cấu hình R2* (`R2_ACCESS_KEY_ID`/`R2_SECRET_ACCESS_KEY`…) nằm ở **Gateway** (§1.1 +
+     `apps/gateway/.dev.vars.example`); thiếu → `POST /api/uploads/presign` FAIL-CLOSED 503,
+     không job nào upload audio được (No-Fake-Success: không bịa URL giả).
 2. Build:
    ```bash
    cd apps/client

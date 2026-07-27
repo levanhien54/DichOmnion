@@ -101,11 +101,14 @@ class AudioService:
         Chống SSRF: chỉ https tới IP công khai, không theo redirect (xem cổng ở trên).
 
         Ràng buộc TOÀN VẸN: nếu `expected_md5` được cung cấp, bytes tải-về PHẢI khớp md5
-        client đã KÝ; lệch -> từ chối (fail-closed), KHÔNG ghi file. Object key R2 dùng chung
-        cho mọi job (presigned PUT chỉ trỏ 1 key) nên một job khác có thể ghi đè object; kiểm
-        này biến "tải nhầm audio của tenant khác" thành từ chối an toàn. Tham số để mặc định
-        None CHỈ phục vụ test cổng SSRF gọi trực tiếp; đường sản xuất (process_job) LUÔN truyền
-        md5 và đã fail-closed nếu thiếu, nên không có khe bỏ qua kiểm ở runtime thật.
+        client đã KÝ; lệch -> từ chối (fail-closed), KHÔNG ghi file. Theo thiết kế "Gateway
+        ký URL mỗi job" (apps/gateway/src/r2presign.ts), object key nay là DUY NHẤT theo
+        (device, job): `audio/<deviceId>/<jobId>.wav` — nên cross-tenant/cross-job overwrite
+        đã bị chặn về mặt cấu trúc (deviceId khác không thể trỏ cùng key). md5 vẫn giữ làm
+        HÀNG RÀO TOÀN VẸN phòng thủ theo lớp: bắt hỏng-mạng và cả trường hợp hiếm cùng-thiết-bị
+        tái dùng jobId ghi đè key của chính nó. Tham số để mặc định None CHỈ phục vụ test cổng
+        SSRF gọi trực tiếp; đường sản xuất (process_job) LUÔN truyền md5 và đã fail-closed nếu
+        thiếu, nên không có khe bỏ qua kiểm ở runtime thật.
         """
         # Cổng SSRF TRƯỚC khi mở bất kỳ kết nối nào (fail-closed). Vì kiểm host nội bộ
         # xảy ra trước cả khi connect, không có khác biệt thời gian "host up vs down"

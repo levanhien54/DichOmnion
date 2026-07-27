@@ -1,15 +1,19 @@
-"""Ràng buộc TOÀN VẸN NỘI DUNG cho audio tải-về (Đợt 14).
+"""Ràng buộc TOÀN VẸN NỘI DUNG cho audio tải-về (Đợt 14; ghi chú lại Đợt 30).
 
-Object key R2 dùng CHUNG cho mọi job/bản build: presigned PUT client dùng chỉ trỏ tới
-ĐÚNG MỘT key (VITE_AUDIO_UPLOAD_URL/VITE_AUDIO_PUBLIC_URL là scalar build-time). Hai job
-chồng lấn -> job sau ghi đè object -> worker của job A có thể tải nhầm audio RIÊNG TƯ của
-tenant B. Chữ ký ECDSA chỉ ràng buộc TÁC GIẢ payload, không ràng buộc BYTES tại URL.
+BỐI CẢNH Đợt 14 (vì sao có lớp md5 này): thuở đó object key R2 dùng CHUNG cho mọi job/bản
+build (presigned PUT trỏ tới ĐÚNG MỘT key scalar build-time). Hai job chồng lấn -> job sau
+ghi đè object -> worker của job A có thể tải nhầm audio RIÊNG TƯ của tenant B. Chữ ký ECDSA
+chỉ ràng buộc TÁC GIẢ payload, không ràng buộc BYTES tại URL.
 
-Khắc phục (Layer 1, đóng rò rỉ chéo tenant theo tiêu chí #2 Zero-Logging Privacy): client
-KÝ kèm md5 của audio; worker so md5 bytes tải-về với md5 đã ký và FAIL-CLOSED khi lệch ->
-biến "tải nhầm audio tenant khác" thành TỪ CHỐI an toàn, không xử lý audio không rõ nguồn.
-(Layer 2 — key duy nhất mỗi job — cần gateway presign bằng creds ghi R2; đó là residual
-KHẢ DỤNG đã ghi nhận, KHÔNG giả xanh ở đây.)
+Layer 1 (đóng rò rỉ chéo tenant theo tiêu chí #2 Zero-Logging Privacy): client KÝ kèm md5
+của audio; worker so md5 bytes tải-về với md5 đã ký và FAIL-CLOSED khi lệch -> biến "tải
+nhầm audio tenant khác" thành TỪ CHỐI an toàn, không xử lý audio không rõ nguồn.
+
+Layer 2 (ĐÃ TRIỂN KHAI ở Đợt 30 — Option A "Gateway ký URL mỗi job"): Gateway ký presigned
+PUT/GET cho key DUY NHẤT theo (device, job) = audio/<deviceId>/<jobId>.wav, nên hai job
+KHÔNG còn dùng chung object -> vector ghi-đè-chéo-tenant đã đóng ngay ở tầng key. Lớp md5
+dưới đây GIỮ NGUYÊN như phòng-thủ-nhiều-tầng (defense-in-depth): dù key đã duy nhất, worker
+vẫn từ chối bytes không khớp md5 đã ký. Các test này khóa chính bất biến md5 đó.
 
 Các test khóa 3 bất biến:
   1) md5 khớp  -> trả path, ghi ĐÚNG bytes.

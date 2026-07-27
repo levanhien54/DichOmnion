@@ -1,6 +1,9 @@
 name = "dichomnion-gateway"
 main = "src/index.ts"
 compatibility_date = "2023-12-01"
+# Tài khoản Cloudflare đích cho deploy thật (Track A). Không phải bí mật (account id
+# hiện ngay trên URL dashboard). Có thể override bằng env CLOUDFLARE_ACCOUNT_ID.
+account_id = "385e2b411beb41a79d6b45477bc3f544"
 
 # KV: rate-limit đăng ký, idempotency job, trạng thái job/kết quả, và cờ kill switch.
 # id dưới đây là PLACEHOLDER cho dev. TRƯỚC KHI deploy thật phải tạo namespace và thay id:
@@ -32,6 +35,21 @@ ALLOWED_ORIGINS = "tauri://localhost,https://tauri.localhost,http://localhost:14
 # JOBS_RATE_LIMIT = "60"
 # JOBS_WINDOW_S = "3600"
 
+# R2 (object storage cho AUDIO) — endpoint POST /api/uploads/presign ký presigned URL mỗi
+# job (Option A: Gateway ký, KHÔNG trung chuyển bytes). R2_ACCOUNT_ID/R2_BUCKET KHÔNG bí mật
+# nên đặt ở [vars]; bỏ comment và điền khi deploy (ACCESS_KEY/SECRET là secret — xem dưới).
+# Thiếu bất kỳ biến BẮT BUỘC nào (kể cả 2 secret) → endpoint FAIL-CLOSED 503, không job nào chạy.
+# 2 biến KHÔNG bí mật dưới đây để mở sẵn (endpoint vẫn 503 tới khi 2 secret ACCESS/SECRET được
+# nạp qua `wrangler secret put`); mở sẵn để tránh quên uncomment lúc deploy → presign 503 oan.
+R2_ACCOUNT_ID = "385e2b411beb41a79d6b45477bc3f544"
+R2_BUCKET = "sonsonjh"
+# Tuỳ chọn (có mặc định trong code): R2_REGION="auto", R2_PRESIGN_EXPIRES_S="7200" (max 604800),
+# PRESIGN_RATE_LIMIT="60", PRESIGN_WINDOW_S="3600".
+# R2_REGION = "auto"
+# R2_PRESIGN_EXPIRES_S = "7200"
+# PRESIGN_RATE_LIMIT = "60"
+# PRESIGN_WINDOW_S = "3600"
+
 # --- SECRETS (KHÔNG commit — nạp bằng: wrangler secret put <TÊN>) ------------
 # GATEWAY_JWT_PRIVATE_KEY : PKCS8 PEM khóa RIÊNG ES256 (P-256) của Gateway.
 #                           Worker chỉ giữ khóa CÔNG KHAI tương ứng (Trạm 2).
@@ -41,3 +59,6 @@ ALLOWED_ORIGINS = "tauri://localhost,https://tauri.localhost,http://localhost:14
 # TURNSTILE_SECRET        : Secret key Cloudflare Turnstile (chống bot khi đăng ký).
 # ADMIN_TOKEN             : Bí mật chia sẻ cho watchdog Financial Kill Switch
 #                           (apps/gateway/scripts/kill-switch-monitor.mjs) gọi /api/admin/kill-switch.
+# R2_ACCESS_KEY_ID        : Access Key ID của R2 S3 API token (Object Read & Write).
+# R2_SECRET_ACCESS_KEY    : Secret Access Key tương ứng — Gateway ký SigV4 cho /api/uploads/presign.
+#                           Tạo token: Dashboard → R2 → Manage R2 API Tokens.

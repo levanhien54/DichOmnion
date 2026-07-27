@@ -97,7 +97,7 @@ Nghiêm trọng nhất, **quy tắc số 1 bị đảo ngược**: client upload
 
 ---
 
-## Phụ lục B — Trạng thái khắc phục (cập nhật 2026-07-26, sau Đợt 28 — logic **HỘI TỤ K=2** ở Đợt 27, Đợt 28 = đối-chiếu docs/config triển-khai; residual_hardware RH1–RH11 vẫn chờ Track-A)
+## Phụ lục B — Trạng thái khắc phục (cập nhật 2026-07-27, sau Đợt 30 — logic **HỘI TỤ K=2** ở Đợt 27; Đợt 28–29 = đối-chiếu docs/config + hoàn-thiện dev-box; Đợt 30 = triển-khai tính-năng R2 "ký URL mỗi job" (Option A); residual_hardware RH1–RH11 + round-trip R2 thật vẫn chờ Track-A)
 
 > Đã khắc phục **toàn bộ 7 nhóm Critical**. Mục này ghi lại *chính xác điều gì đã sửa*, *bằng chứng kiểm thử*, và *phần dư còn lại (residual)* — không tuyên bố quá lời. Bản đánh giá gốc (Mục 1–5, Phụ lục A) được giữ nguyên làm mốc thời điểm.
 
@@ -804,6 +804,89 @@ Ngoài 7 nhóm Critical, các hạng mục sau (từ Mục 5 khuyến nghị) đ
 **Câu-hỏi tồn-đọng ĐÃ GIẢI-QUYẾT (người dùng quyết 2026-07-26):** **ducking `-5dB` vs `-10dB`** (Đợt 28 #1) — người dùng chọn **giữ `-5dB`** (hành-vi production không đổi: `model_manager.py:303` vẫn `ducking_db=-5.0`) **và đồng-bộ default của `mix_audio`** từ `-10.0` → **`-5.0`** (`audio_engine.py:140`) cho khớp call-site, tránh nhầm về sau. **Behavior-preserving đã kiểm-chứng:** call-site production **duy-nhất** truyền `-5.0` tường-minh; mọi call khác là test truyền tường-minh (kể cả A6 truyền `-10.0`) hoặc monkeypatch thay-thế ⇒ đổi default KHÔNG đổi hành-vi. Chạy lại `python -m pytest -q` sau khi đổi: **228 passed, 1 skipped, 4 deselected** (không hồi-quy). Thêm chú-thích tại chỗ nêu rõ default khớp call-site. → **KHÔNG còn câu-hỏi tồn-đọng.** (Ghi-chú no-lint: repo chưa cấu-hình linter; KHÔNG thêm tooling lint đơn-phương ở tier này — YAGNI, nêu để người dùng biết.)
 
 **Ranh-giới residual (KHÔNG giả-xanh, Track-A):** không đổi so Đợt 28 — RH1–RH11 nguyên-vẹn; Đợt 29 **không** đụng tới nhóm này (không build image, không fp16, không deploy Cloudflare thật, không đo độ-trễ).
+
+### Đợt 30 (2026-07-27) — R2 Option A: **"Gateway ký URL presigned mỗi job"** (triển-khai tính-năng theo LỰA-CHỌN người dùng — KHÔNG phải vòng rà-soát logic)
+
+> **Phân loại rõ ràng:** Đợt 30 **không** là vòng rà-soát đối-kháng tầng-logic ⇒ **không đảo ngược** tuyên-bố HỘI-TỤ K=2 (Đợt 27). Đây là **triển-khai một tính-năng mới** theo chỉ-đạo người dùng: thử kết-nối R2 thật (mã tài-khoản `385e2b411beb41a79d6b45477bc3f544`, S3 endpoint `<id>.r2.cloudflarestorage.com`) làm lộ ra rằng thiết-kế upload cũ dựa trên **URL tĩnh dùng-chung** (`VITE_AUDIO_UPLOAD_URL`/`VITE_AUDIO_PUBLIC_URL`) là điểm yếu (một object key cho MỌI job → job/tenant ghi đè nhau, và deployer phải tự phát presigned URL ngoài luồng). Người dùng chọn phương-án **A — "Gateway ký URL mỗi job (Recommended)"**. Toàn-bộ code mới viết theo **TDD nghiêm** (RED→GREEN mỗi bước).
+
+**Kiến-trúc mới:** với MỖI job, client gọi `POST /api/uploads/presign` (auth trùng khớp `/api/jobs/create`: `X-Device-Id` + `X-ECDSA-Signature` ký trên `deterministicStringify({jobId, timestamp})`); Gateway **KÝ** một cặp presigned R2 PUT+GET (SigV4 bằng WebCrypto, **0 dependency**) cho object key **DUY NHẤT** `audio/<deviceId>/<jobId>.wav`, rồi trả về. Client PUT audio thẳng lên R2, worker GET về. Gateway **CHỈ ký URL — không bao giờ chạm bytes audio** (Zero-Logging giữ nguyên).
+
+| R2 | Việc | Kết quả / ghi chú |
+|---|---|---|
+| A | Module presigner `apps/gateway/src/r2presign.ts` + test | SigV4 thuần WebCrypto (`sigv4Signature`/`presignS3Url`/`mintJobAudioUrls`/`amzDate`). **Pin đúng-đắn bằng 2 vector quyền-uy:** AWS test-suite `get-vanilla` (chứng-minh chuỗi dẫn-xuất khóa + HMAC cuối: `5fa00fa3…`) và ví-dụ presigned GET `examplebucket` (chứng-minh canonical query + lắp URL, UNSIGNED-PAYLOAD: `3ed0be64…`). **12 test** xanh. *(Ghi-chú: giá-trị `aeeed9bb…`/`f0e8bdb8…` trong prose của doc AWS là ERRATA — không tự-mâu-thuẫn với string-to-sign đã công-bố; ta khẳng-định giá-trị DẪN-XUẤT-ĐÚNG, không lặp lại errata.)* |
+| B | Endpoint mint `POST /api/uploads/presign` (`src/index.ts`) + test | Fail-closed đầy-đủ, tái-dùng đúng khung `/api/jobs/create`: kill-switch→503, thiếu sig/deviceId→401, device chưa đăng-ký→401, chữ-ký sai→403, replay (±30s)→403, thiếu/không-phải-string `jobId`→400, lone-surrogate `jobId`→400, **thiếu BẤT KỲ R2 cred→503** (fail-closed, không bịa URL), throttle per-device (`rl:presign:<deviceId>`, mặc-định 60/h)→429. **10 test** xanh. Thêm 8 binding R2 vào `Bindings` (đều optional). |
+| C | Client `apps/client/src/lib/transport.ts` xin URL mỗi-job + test | Viết lại `uploadAudioForWorker({audioPath, gatewayUrl, deviceId, jobId, signPayload})`: ký+POST mint → PUT bytes lên `uploadUrl` đã ký → trả `getUrl`. **Bỏ hẳn** `VITE_AUDIO_UPLOAD_URL`/`VITE_AUDIO_PUBLIC_URL`. `App.tsx submitJob`: sinh `jobId` **TRƯỚC** khi mint (cùng một jobId lái object key), truyền closure ký bằng khóa non-extractable (private key **không** rời `App.tsx`). **3 test** (mint→PUT→getUrl; mint lỗi→ném rõ; mint lỗi→**KHÔNG** PUT — bytes không rời máy). |
+| — | Đối-chiếu doc/config lan-toả | `.env.example` (client): xoá 2 biến `VITE_AUDIO_*`, giải-thích luồng mint. `.dev.vars.example` + `wrangler.toml` (gateway): thêm khối R2 (`R2_ACCOUNT_ID`/`R2_BUCKET` non-secret + `R2_ACCESS_KEY_ID`/`R2_SECRET_ACCESS_KEY` **secret** + tuỳ-chọn region/expires/throttle), hướng-dẫn tạo R2 S3 API token. **Đính-chính comment cũ** ở `audio_service.py:106`: câu *"object key dùng chung cho mọi job"* nay SAI — key đã DUY-NHẤT theo (device,job) nên cross-tenant overwrite bị chặn cấu-trúc; md5 giữ làm **hàng-rào toàn-vẹn phòng-thủ-lớp** (bắt hỏng-mạng + hiếm-khi cùng-device tái-dùng jobId). Cổng SSRF worker đã sẵn chấp-nhận host R2 (https + IP công-khai + không redirect + giữ query). CSP client đã có `https://*.r2.cloudflarestorage.com`. |
+
+**Xanh Đợt 30 (5 cổng dev-box, chạy TƯƠI 2026-07-27):**
+
+| Suite | Lệnh | Kết quả |
+|---|---|---|
+| TypeScript (gộp) | `pnpm run test:ts` | **exit 0** — crypto-utils **8**, gateway **142 passed** (86+33+1+**12 r2presign**+**10 presign-endpoint** gộp trong 5 file), client **10** (7 timecode + **3 transport**) |
+| Worker (mock) | `python -m pytest -q` | **228 passed, 1 skipped, 4 deselected** (không hồi-quy; chỉ đổi 1 comment) |
+| Gateway build | `npx wrangler deploy --dry-run` | **build OK** (134.37 KiB — gồm module `r2presign.ts` mới; bindings hợp-lệ) |
+| Client build | `tsc && vite build` | **exit 0** (1482 modules; App.tsx + transport.ts biên-dịch sạch) |
+| Client — Rust | `cargo test` | **18 passed; 0 failed** |
+
+**Ranh-giới residual (KHÔNG giả-xanh, Track-A):** vòng **round-trip R2 THẬT cuối cùng** (mint→PUT thật→worker GET thật) cần **R2 Access Key ID + Secret Access Key THẬT** của người dùng nạp vào Gateway qua `wrangler secret put` — **KHÔNG** tự nhập/không nhận khóa (ràng-buộc an-toàn: nhập bí-mật là hành-vi BỊ CẤM, phải do người dùng tự làm). Đến khi có cred thật + Gateway deploy, endpoint đúng-như-thiết-kế trả **503 fail-closed** (đã kiểm bằng test). RH1–RH11 nguyên-vẹn; Đợt 30 **không** đụng nhóm phần-cứng đó.
+
+### Đợt 31 (2026-07-27) — Xác-nhận THỰC-TẾ Gateway/Cloudflare bằng **workerd runtime thật** (`wrangler dev`) + đóng drift Option A
+
+> **Phân loại:** không phải vòng rà-soát logic (không đảo tuyên-bố HỘI-TỤ K=2). Đây là **kiểm-chứng vận-hành** theo chỉ-đạo người dùng ("*cần xác-nhận thực-tế phần Gateway/Cloudflare đã hoạt-động đúng ổn-định chưa*"). Chốt then: mọi cổng "xanh" trước nay (`vitest`, `wrangler deploy --dry-run`) đều chạy Hono qua `app.request()` trong Node HOẶC chỉ bundle — **KHÔNG** khởi-động runtime thật. Đợt 31 boot **workerd thật** (miniflare, cục-bộ, offline) qua `wrangler dev` rồi bắn HTTP thật vào mọi endpoint bằng **crypto quyền-uy của chính repo** (không tái-hiện). Việc này lập-tức lộ ra 2 khiếm-khuyết thật mà mọi cổng cũ bỏ sót.
+
+**A — Đóng drift Option A (dev-box, không cần phần-cứng):** `.env.example` (worker) dòng 61 sửa "*từ VITE_AUDIO_PUBLIC_URL*" → "*từ presigned GET (Gateway ký mỗi job)*"; docstring `tests/test_audio_integrity.py` bổ-sung "Layer 2 (ĐÃ TRIỂN-KHAI Đợt 30 — Option A)" giữ nguyên "vì sao" lịch-sử của lớp md5 (phòng-thủ-nhiều-tầng) nhưng đính-chính 2 khẳng-định cũ đã lỗi-thời. Artefact deploy (`r2-cors.json`) sẵn cho bước cấp-phát R2 thật.
+
+**B — Kiểm-chứng live-local + 2 phát-hiện thật:**
+
+| # | Phát hiện (thật) | Vì sao cổng cũ bỏ sót | Sửa | Kiểm-chứng |
+|---|---|---|---|---|
+| **WKD-01** *(deploy-blocking)* | 5 hằng-số plain-value `export const MAX_*` từ **module entrypoint** `apps/gateway/src/index.ts` khiến workerd **từ-chối khởi-động**: `Incorrect type for map entry 'MAX_FREETEXT_CHARS': the provided value is not of type 'function or ExportedHandler'. The Workers runtime failed to start.` Entry module chỉ được export handler/function/ExportedHandler/class — **không** được export giá-trị thô. | `wrangler deploy --dry-run` chỉ **bundle** (esbuild không kiểm luật entry); `vitest` chỉ gọi `app.request()` trong Node — **cả hai không boot runtime**. Chỉ `wrangler dev`/`deploy` thật mới bắt. **No-Fake-Success win:** 2 cổng "xanh" che một lỗi chặn-deploy thật. | Tách 5 hằng-số sang **`apps/gateway/src/limits.ts`**; `index.ts` **import** (KHÔNG re-export → entrypoint chỉ còn export `default` + hàm `dispatchToWorker`); `gateway.test.ts` trỏ import sang `../src/limits`. Comment đầy-đủ nêu rõ luật entry. | Boot `wrangler dev` (trước đó FAIL) nay **thành-công**; regression lật đỏ→xanh. |
+| **HYG-01** | Commit `be6b478` **vô-tình track `apps/gateway/.wrangler/`** (KV blob miniflare, SQLite WAL, esbuild tmp bundle) — trạng-thái runtime tái-sinh mỗi lần chạy, KHÔNG được nằm trong git; `.gitignore` cũng thiếu quy-tắc này. | `.wrangler/` chỉ xuất-hiện khi thực-sự CHẠY runtime; các đợt trước không boot nên không lộ. | Thêm `.wrangler/` vào `.gitignore` (Cloudflare scaffolding luôn ignore); xoá bản local. `git check-ignore` xác-nhận đã ignore. Bản đã-track sẽ rời repo ở lần commit tới của người dùng (KHÔNG tự commit). | — |
+
+**Ma-trận kiểm-chứng live (HTTP thật vào `wrangler dev`, crypto ký bằng dist quyền-uy của repo, harness fail-loud):**
+
+| Chế-độ | Số kiểm | Bao phủ |
+|---|---|---|
+| **WITH-R2** (đủ cred dummy) | **27/27 PASS** | health 200; CORS **cho** `tauri://localhost` (204) / **từ-chối** origin lạ (không phản-chiếu ACAO); register→201; **ma-trận presign** thiếu-sig→401 / device-chưa-đăng-ký→401 / sig-sai→403 / timestamp-hết-hạn→403 / thiếu-jobId→400 / hợp-lệ→**200 + URL SigV4 đúng hình** (host R2, `X-Amz-*`, sig 64-hex); **key DUY-NHẤT** `audio/<device>/<job>.wav`; PUT-sig ≠ GET-sig; job khác→key khác; jobs/create thiếu-sig→401 / ký-hợp-lệ→**202 QUEUED+etaSeconds** / gửi-lại→202 idempotent / body-giả-mạo→403; **kill-switch** vòng đầy-đủ 403/403/400/200-ACTIVE→register-503→200-CLEARED→register-201. |
+| **--no-r2** (thiếu R2 secret) | **18/18 PASS** | như trên nhưng presign hợp-lệ-nhưng-CHƯA-CẤP-PHÁT → **503 fail-closed** (`{"error":"Upload storage not provisioned"}`) — chứng-minh **KHÔNG bịa URL** khi thiếu cred. |
+
+**Xanh Đợt 31 (chạy TƯƠI 2026-07-27, sau khi sửa WKD-01):**
+
+| Suite | Lệnh | Kết quả |
+|---|---|---|
+| TypeScript (gộp) | `pnpm run test:ts` | **exit 0** — crypto-utils **8**, gateway **142 passed** (5 file), client **10** + `tsc --noEmit` sạch |
+| Gateway build | `npx wrangler deploy --dry-run` | **build OK** (134.27 KiB; bindings hợp-lệ) |
+| Gateway **runtime thật** | `wrangler dev` + harness HTTP | **WITH-R2 27/27**, **--no-r2 18/18** — boot thành-công, mọi endpoint đúng hợp-đồng |
+
+*(Không chạy lại `python -m pytest` / `vite build` / `cargo test` đợt này: thay-đổi **chỉ nằm trong `apps/gateway` (TS) + `.gitignore`**, ba nhóm kia độc-lập về logic — mốc xanh gần nhất là Đợt 30. Nêu trung-thực thay vì ngầm-hiểu "đã chạy".)*
+
+**Ranh-giới residual (KHÔNG giả-xanh, Track-A):** Đợt 31 xác-nhận Gateway **ổn-định trên runtime thật cục-bộ** với **R2 dummy** — nhưng round-trip R2 **THẬT** (mint→PUT thật lên bucket `dichomnion-audio`→worker GET thật) vẫn cần **R2 Access Key ID + Secret THẬT** người dùng nạp qua `wrangler secret put` + Gateway deploy live (nhập bí-mật là hành-vi BỊ CẤM với trợ-lý). RH1–RH11 nguyên-vẹn; Đợt 31 **không** đụng nhóm phần-cứng đó. Bước kế: người dùng cấp R2 cred thật → round-trip cuối, rồi Track-A GPU acceptance.
+
+### Đợt 32 (2026-07-27) — Vòng rà-soát **CHUYÊN-BIỆT ĐẦU-TIÊN** cho khối R2 Option A + đổi bucket → `sonsonjh`
+
+> **Phân loại:** vòng rà-soát-đối-kháng có mục-tiêu, **không** đảo tuyên-bố HỘI-TỤ K=2 (Đợt 26/27). Chốt then: khối **R2 Option A** (`r2presign.ts`, endpoint `/api/uploads/presign`, `limits.ts`, `transport.ts`) được thêm vào **SAU** vòng hội-tụ Đợt 26/27, nên **chưa từng** qua một vòng review chuyên-biệt. Đợt 32 mở đúng một vòng vào riêng khối đó: **4 finder đa-lăng-kính** (SigV4/crypto · auth/tenant/replay · fail-closed/logging · client-contract) → **mỗi phát-hiện bị 1 verifier phản-bác mặc-định-bác-bỏ** (chỉ giữ defect thật). Kết-quả: **2 phát-hiện thô → 1 XÁC-NHẬN, 1 bác-bỏ**.
+
+**Đổi cấu-hình (theo chỉ-đạo người dùng "*hãy dùng sonsonjh*"):** `R2_BUCKET` `dichomnion-audio` → **`sonsonjh`** trong `wrangler.toml:45`, `.dev.vars.example:35`, và 2 lệnh CORS trong `docs/DEPLOYMENT.md`. Đã kiểm live: đường ký SigV4 nay là `/sonsonjh/audio/<device>/<job>.wav`. (Test-fixture `presign_endpoint.test.ts`/`r2presign.test.ts` **cố ý** giữ `dichomnion-audio` — chúng là mock tự-chứa, đổi = churn thẩm-mỹ + rủi-ro hồi-quy vô-ích.)
+
+**Phát-hiện & xử-lý:**
+
+| # | Phát hiện | Verdict | Vì sao vòng cũ bỏ sót | Sửa / Ghi-nhận | Kiểm-chứng |
+|---|---|---|---|---|---|
+| **F-R2-01** *(No-Fake-Success)* | Endpoint presign chỉ gác `jobId` bằng **truthy-string + lone-surrogate** — **y-hệt** job-creation, nơi `jobId` là **KV key PHẲNG** `job:<dev>:<id>` (`/` và `.` vô-hại). Nhưng ở presign, `jobId` nội-suy vào **object key PHÂN-CẤP** `audio/<deviceId>/<jobId>.wav` → đường canonical URI của SigV4 (`r2presign` giữ `/` **literal**, coi `.` là **unreserved**). `/` **định-lại hình key** (phá bất-biến one-key-per-job mà chính comment endpoint (index.ts:554-555) khẳng-định); `/../` hay `/./` **dot-segment** sống-sót vào đường **ĐÃ-KÝ**, nhưng WHATWG URL parser **chuẩn-hoá nó biến mất trên dây** → R2 trả **SignatureDoesNotMatch** dù Gateway **đã trả 200** → job không bao giờ upload/fetch được audio (thất-bại mờ tận downstream). | **CONFIRMED** (verifier: severity **low** — self-inflicted; **KHÔNG** phá tenant-isolation vì prefix luôn dùng `deviceId` đã-xác-thực, `..` là literal trong R2 key (không resolve server-side), mismatch fail-closed → không escape chéo-thiết-bị, không DoS (đã rate-limit)). | Khối R2 mới toanh (Đợt 30-32), **chưa** qua review chuyên-biệt; các vòng Đợt 17-25 gác `jobId` cho **sink Qwen tokenizer / KV phẳng**, chưa ai soi sink **đường-URL phân-cấp**. `vitest`+`app.request` chấp-nhận 200 (đúng routing) nên không lộ tính DOA (chỉ lộ khi PUT thật). | **Allowlist an-toàn-đường-URL** `^[A-Za-z0-9_-]+$` + `MAX_JOBID_CHARS=128` (limits.ts) trong presign, **thay** gác lone-surrogate cũ (allowlist **bao trùm chặt** nó). Client duy-nhất chỉ mint `JOB-<epoch_ms>` → không bao giờ bị từ-chối oan. **KHÔNG** đụng job-creation (KV phẳng — verifier xác-nhận vô-hại ở đó). | **TDD**: 2 test RED (`a/b`→200✗, `a/../b`→200✗) → sau fix **400**; +1 test dương `JOB-<epoch>`→200. |
+| RL-RACE | Rate-limit presign non-atomic (get-then-put, KV không CAS) → về lý-thuyết bypass bằng request đồng-thời. | **REFUTED** | — | **Bác-bỏ (ghi trung-thực):** cùng lớp TOCTOU đã khai-báo ở **G-03** (cần Durable Object mới đóng nguyên-tử); fail-closed & self-limiting (mỗi request vẫn +1), không phải lỗ-hổng — **không** vá bằng khóa-giả KV (security-theater). | — |
+
+**Xanh Đợt 32 (chạy TƯƠI 2026-07-27, sau fix F-R2-01):**
+
+| Suite | Lệnh | Kết quả |
+|---|---|---|
+| Gateway (vitest) | `npx vitest run` | **145 passed** (5 file; presign **13/13** — gồm 2 test path mới + 1 dương client-shaped) |
+| TypeScript | `tsc --noEmit` | **exit 0** (`hasLoneSurrogate` vẫn dùng ở 5 sink khác — không dead-import) |
+| Gateway build | `npx wrangler deploy --dry-run` | **build OK** (bindings hợp-lệ; `R2_BUCKET: "sonsonjh"`) |
+| Gateway **runtime thật** | `wrangler dev` + harness HTTP | **WITH-R2 27/27** — presign vẫn mint đúng cho jobId hợp-lệ (`audio/<device>/job-abc-123.wav`), chứng-minh allowlist **không** siết oan |
+
+*(Không chạy lại `pytest`/`vite build`/`cargo test` đợt này: thay-đổi **chỉ trong `apps/gateway` (TS) + config bucket + doc**, ba nhóm kia độc-lập logic — mốc xanh gần nhất Đợt 30/31. Nêu trung-thực thay vì ngầm-hiểu "đã chạy".)*
+
+**Ranh-giới residual (KHÔNG giả-xanh, Track-A):** harness `gwverify.mjs` **đã có** chế-độ `--real-r2` (mint→PUT bytes WAV thật→GET→so-byte, fail-loud `exit 4` khi thiếu/cred-dummy) — nhưng round-trip **THẬT** vẫn **chặn ở người dùng**: cần tạo **S3 API token** (Dashboard → R2 → Manage R2 API Tokens → Object Read & Write trên `sonsonjh`) rồi đặt **đúng 2 dòng** `R2_ACCESS_KEY_ID`/`R2_SECRET_ACCESS_KEY` vào `apps/gateway/.dev.vars` (nhập bí-mật là hành-vi BỊ CẤM với trợ-lý). RH1–RH11 nguyên-vẹn; Đợt 32 **không** đụng nhóm phần-cứng đó.
 
 ### B.5 — G-03 & G-05 — Ranh giới kiến trúc/hạ tầng (khai báo trung thực)
 

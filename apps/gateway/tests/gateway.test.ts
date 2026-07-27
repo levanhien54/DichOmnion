@@ -1,11 +1,12 @@
 import { describe, it, expect } from 'vitest';
-import app, {
+import app from '../src/index';
+import {
   MAX_SEGMENTS,
   MAX_SEGMENT_TEXT_CHARS,
   MAX_TOTAL_TEXT_CHARS,
   MAX_FREETEXT_CHARS,
   MAX_SEGMENT_META_CHARS,
-} from '../src/index';
+} from '../src/limits';
 import { MemoryKV } from './setup';
 import { generateECDSAKeyPair, signPayload } from '@dichomnion/crypto-utils';
 import { JobRequest, deterministicStringify } from '@dichomnion/shared-types';
