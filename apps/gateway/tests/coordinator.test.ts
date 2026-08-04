@@ -6,6 +6,8 @@ import {
   coordinatorCreate,
   coordinatorTransition,
   coordinatorGet,
+  coordinatorMarkEnqueued,
+  coordinatorAcquireDispatch,
   TERMINAL_STATES,
 } from '../src/coordinator';
 
@@ -134,6 +136,99 @@ describe('JobCoordinator.get', () => {
     const rec = await coordinatorGet(coord);
     expect(rec?.status).toBe('QUEUED');
     expect(rec?.jobId).toBe(JOB);
+  });
+});
+
+// ── M1 review (Bug A): durable hand-off confirmation marker ──────────────────
+// The producer commits the DO record BEFORE it enqueues the dispatch message, and
+// those are non-atomic. To tell "created but never enqueued" (an orphan a failed
+// send left behind) from "created and enqueued", the DO carries an internal
+// `enqueued` marker set ONLY after a confirmed send. It must never leak into the KV
+// poll projection (which the client reads).
+describe('JobCoordinator.markEnqueued — durable hand-off confirmation (Bug A)', () => {
+  it('sets the internal enqueued marker on the DO record WITHOUT projecting it to the KV poll contract', async () => {
+    const { coord, kv } = makeCoordinator();
+    await coordinatorCreate(coord, { deviceId: DEV, jobId: JOB, etaSeconds: 12 });
+
+    expect((await coordinatorGet(coord))?.enqueued).toBeUndefined();
+
+    await coordinatorMarkEnqueued(coord);
+
+    expect((await coordinatorGet(coord))?.enqueued).toBe(true);
+    // The KV projection the poll endpoint reads must stay clean (no internal leak).
+    const projected = await kv.get(`job:${DEV}:${JOB}`, { type: 'json' });
+    expect(projected.enqueued).toBeUndefined();
+    expect(projected.status).toBe('QUEUED');
+  });
+
+  it('is idempotent: a second markEnqueued keeps enqueued=true', async () => {
+    const { coord } = makeCoordinator();
+    await coordinatorCreate(coord, { deviceId: DEV, jobId: JOB });
+    await coordinatorMarkEnqueued(coord);
+    await coordinatorMarkEnqueued(coord);
+    expect((await coordinatorGet(coord))?.enqueued).toBe(true);
+  });
+
+  it('throws when marking a job that was never created', async () => {
+    const { coord } = makeCoordinator();
+    await expect(coordinatorMarkEnqueued(coord)).rejects.toThrow(/never created/i);
+  });
+});
+
+// ── M1 review (Bug B): dispatch lease ────────────────────────────────────────
+// At-least-once redelivery can hand the same job to a second consumer while the
+// first is still rendering. acquireDispatch is the ATOMIC guard: a fresh lease means
+// a live delivery owns the render (defer, do not double-dispatch); an EXPIRED lease
+// means the owner died (take over). Terminal jobs never re-acquire. The lease is
+// internal and must not leak into the KV poll projection.
+describe('JobCoordinator.acquireDispatch — dispatch lease (Bug B)', () => {
+  it('acquires a fresh QUEUED job: DISPATCHING + a lease, projecting DISPATCHING to KV (no lease leak)', async () => {
+    const { coord, kv } = makeCoordinator();
+    await coordinatorCreate(coord, { deviceId: DEV, jobId: JOB });
+
+    const r = await coordinatorAcquireDispatch(coord, { leaseMs: 10_000, now: 1_000 });
+    expect(r.outcome).toBe('acquired');
+    expect(r.record.status).toBe('DISPATCHING');
+
+    const projected = await kv.get(`job:${DEV}:${JOB}`, { type: 'json' });
+    expect(projected.status).toBe('DISPATCHING');
+    expect(projected.leaseExpiresAt).toBeUndefined(); // internal, not in the poll contract
+  });
+
+  it('reports BUSY when a fresh lease is already held (a concurrent redelivery must not double-dispatch)', async () => {
+    const { coord } = makeCoordinator();
+    await coordinatorCreate(coord, { deviceId: DEV, jobId: JOB });
+    await coordinatorAcquireDispatch(coord, { leaseMs: 10_000, now: 1_000 }); // lease → 11_000
+
+    const r = await coordinatorAcquireDispatch(coord, { leaseMs: 10_000, now: 5_000 });
+    expect(r.outcome).toBe('busy');
+    expect(r.record.status).toBe('DISPATCHING');
+  });
+
+  it('TAKES OVER when the prior lease has expired (the owning delivery died mid-render)', async () => {
+    const { coord } = makeCoordinator();
+    await coordinatorCreate(coord, { deviceId: DEV, jobId: JOB });
+    await coordinatorAcquireDispatch(coord, { leaseMs: 10_000, now: 1_000 }); // lease → 11_000
+
+    const r = await coordinatorAcquireDispatch(coord, { leaseMs: 10_000, now: 20_000 });
+    expect(r.outcome).toBe('acquired'); // stale lease → takeover
+    expect(r.record.status).toBe('DISPATCHING');
+  });
+
+  it('reports TERMINAL and never re-acquires a job that already finished', async () => {
+    const { coord } = makeCoordinator();
+    await coordinatorCreate(coord, { deviceId: DEV, jobId: JOB });
+    await coordinatorAcquireDispatch(coord, { leaseMs: 10_000, now: 1_000 });
+    await coordinatorTransition(coord, 'DONE', { elapsed: 5000 });
+
+    const r = await coordinatorAcquireDispatch(coord, { leaseMs: 10_000, now: 2_000 });
+    expect(r.outcome).toBe('terminal');
+    expect(r.record.status).toBe('DONE');
+  });
+
+  it('throws when acquiring a job that was never created', async () => {
+    const { coord } = makeCoordinator();
+    await expect(coordinatorAcquireDispatch(coord, { leaseMs: 1, now: 1 })).rejects.toThrow(/never created/i);
   });
 });
 

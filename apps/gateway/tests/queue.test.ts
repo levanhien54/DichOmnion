@@ -1,7 +1,7 @@
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import * as jose from 'jose';
 import { handleJobQueue } from '../src/index';
-import { coordinatorCreate, coordinatorGet } from '../src/coordinator';
+import { coordinatorCreate, coordinatorGet, coordinatorAcquireDispatch } from '../src/coordinator';
 import { MemoryKV } from './setup';
 import { makeCoordinatorNamespace } from './do-harness';
 import type { JobRequest } from '@dichomnion/shared-types';
@@ -152,5 +152,76 @@ describe('handleJobQueue — durable dispatch consumer', () => {
     // Not acked (would drop the job); redelivered instead (queue durable retry — the W1 fix).
     expect(retried).toEqual([JOB]);
     expect(acked).toEqual([]);
+  });
+
+  // ── M1 review (Bug B): dispatch lease — no double GPU render on concurrent redelivery ──
+  it('DEFERS (retry, no re-dispatch) when a FRESH dispatch lease is already held by a live delivery', async () => {
+    const kv = new MemoryKV();
+    const pem = await gatewayPrivateKeyPem();
+    const ns = makeCoordinatorNamespace({ KV_CACHE: kv });
+    const env = {
+      KV_CACHE: kv,
+      JOB_COORDINATOR: ns,
+      GATEWAY_JWT_PRIVATE_KEY: pem,
+      WORKER_URL: 'http://127.0.0.1:8000',
+      MAX_RENDER_MS: '5000',
+    };
+
+    const stub = ns.get(ns.idFromName(`${DEV}:${JOB}`));
+    await coordinatorCreate(stub as any, { deviceId: DEV, jobId: JOB, etaSeconds: 23 });
+    // A live delivery already owns the render: it holds a FRESH lease (DISPATCHING).
+    await coordinatorAcquireDispatch(stub as any, { now: Date.now(), leaseMs: 600_000 });
+
+    const fetchMock = vi.fn(async () => new Response('{}', { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const { batch, acked, retried } = makeBatch([{ deviceId: DEV, jobId: JOB, payload: basePayload() }]);
+    await handleJobQueue(batch, env as any);
+
+    // The concurrent redelivery must NOT dispatch a second render, and must defer (retry).
+    expect(fetchMock.mock.calls.some(([u]) => String(u).endsWith('/api/worker/process'))).toBe(false);
+    expect(retried).toEqual([JOB]);
+    expect(acked).toEqual([]);
+  });
+
+  // ── M1 review (Bug C): terminal-KV heal — no re-render, no status regression ──
+  // A prior delivery finished the render (KV `job:` is already terminal) but crashed
+  // before syncing the DO, leaving the DO at DISPATCHING with an EXPIRED lease. Without
+  // the heal, acquireDispatch would TAKE OVER the stale lease and re-dispatch — a second
+  // GPU render that also drags the KV projection back off its terminal state.
+  it('HEALS from a terminal KV projection: syncs the DO and ACKs WITHOUT re-dispatching, even when the DO lease has expired', async () => {
+    const kv = new MemoryKV();
+    const pem = await gatewayPrivateKeyPem();
+    const ns = makeCoordinatorNamespace({ KV_CACHE: kv });
+    const env = {
+      KV_CACHE: kv,
+      JOB_COORDINATOR: ns,
+      GATEWAY_JWT_PRIVATE_KEY: pem,
+      WORKER_URL: 'http://127.0.0.1:8000',
+      MAX_RENDER_MS: '5000',
+    };
+
+    const stub = ns.get(ns.idFromName(`${DEV}:${JOB}`));
+    await coordinatorCreate(stub as any, { deviceId: DEV, jobId: JOB, etaSeconds: 23 });
+    // Prior delivery started then its lease EXPIRED (owner died) — but its render had
+    // already committed a terminal KV projection before dying.
+    await coordinatorAcquireDispatch(stub as any, { now: Date.now() - 1_000_000, leaseMs: 1 });
+    await kv.put(
+      `job:${DEV}:${JOB}`,
+      JSON.stringify({ status: 'DONE', createdAt: Date.now(), etaSeconds: 23, elapsed: 4321 }),
+    );
+
+    const fetchMock = vi.fn(async () => new Response('{}', { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const { batch, acked, retried } = makeBatch([{ deviceId: DEV, jobId: JOB, payload: basePayload() }]);
+    await handleJobQueue(batch, env as any);
+
+    // No re-render, DO healed to DONE, KV stays DONE, message ACKed (not redelivered).
+    expect(fetchMock.mock.calls.some(([u]) => String(u).endsWith('/api/worker/process'))).toBe(false);
+    expect((await coordinatorGet(stub as any))?.status).toBe('DONE');
+    expect((await kv.get(`job:${DEV}:${JOB}`, { type: 'json' })).status).toBe('DONE');
+    expect(acked).toEqual([JOB]);
+    expect(retried).toEqual([]);
   });
 });

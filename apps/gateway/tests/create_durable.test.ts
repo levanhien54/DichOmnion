@@ -114,4 +114,49 @@ describe('/api/jobs/create — durable path (DO + Queue)', () => {
     // The atomic DO guard prevents a second durable hand-off (no double GPU dispatch).
     expect(sent.length).toBe(1);
   });
+
+  // ── M1 review (Bug A): orphan heal ─────────────────────────────────────────
+  // coordinatorCreate commits the DO record BEFORE the dispatch send, and those two
+  // are non-atomic. If the send fails after the commit, the job is an ORPHAN: QUEUED
+  // in the DO, but nothing on the queue will ever render it. The producer confirms a
+  // successful hand-off with an internal `enqueued` marker; a later peek that finds a
+  // QUEUED record WITHOUT that marker must re-enqueue instead of returning a job that
+  // will never run.
+  it('heals an orphaned job: when the durable hand-off send fails after the DO commit, a re-sent create re-enqueues it', async () => {
+    const { env, ns, sent } = makeDurableEnv();
+    const { deviceId, privateKeyJwk } = await registerDevice(env);
+
+    // First create: the DO record commits QUEUED, then the dispatch send FAILS.
+    let failNextSend = true;
+    env.JOB_DISPATCH_QUEUE = {
+      send: async (body: any) => {
+        if (failNextSend) {
+          failNextSend = false;
+          throw new Error('queue temporarily unavailable');
+        }
+        sent.push(body);
+      },
+    };
+
+    await createJob(env, deviceId, privateKeyJwk, 'JOB-ORPHAN');
+    // The send threw → nothing was enqueued…
+    expect(sent.length).toBe(0);
+    // …but the atomic create already committed the DO record as QUEUED (an orphan).
+    const stub = ns.get(ns.idFromName(`${deviceId}:JOB-ORPHAN`));
+    const orphan = await coordinatorGet(stub as any);
+    expect(orphan?.status).toBe('QUEUED');
+    expect(orphan?.enqueued).not.toBe(true); // never confirmed enqueued
+
+    // Client retries the SAME jobId. The peek must detect the orphan and RE-ENQUEUE.
+    const second = await createJob(env, deviceId, privateKeyJwk, 'JOB-ORPHAN');
+    expect(second.res.status).toBe(202);
+    expect((await second.res.json()).idempotent).toBe(true);
+    expect(sent.length).toBe(1); // healed: exactly one dispatch now on the queue
+    expect(sent[0].jobId).toBe('JOB-ORPHAN');
+    // Now confirmed enqueued, so a THIRD create must NOT re-enqueue.
+    expect((await coordinatorGet(stub as any))?.enqueued).toBe(true);
+    const third = await createJob(env, deviceId, privateKeyJwk, 'JOB-ORPHAN');
+    expect(third.res.status).toBe(202);
+    expect(sent.length).toBe(1); // still one — no double dispatch
+  });
 });

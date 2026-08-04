@@ -82,11 +82,16 @@ export class JobCoordinator {
 
   // Write-through the KV projection the poll endpoint reads. Shape MUST stay
   // compatible with the legacy record: { status, createdAt, etaSeconds, ...meta }.
+  // Internal-only fields (deviceId/jobId/updatedAt, plus the producer hand-off marker
+  // `enqueued` and the consumer's `leaseExpiresAt`) are stripped so they never leak
+  // into the client-facing poll contract.
   private async projectToKv(record: JobRecord): Promise<void> {
-    const { deviceId, jobId, updatedAt, ...rest } = record;
+    const { deviceId, jobId, updatedAt, enqueued, leaseExpiresAt, ...rest } = record;
     void deviceId;
     void jobId;
     void updatedAt;
+    void enqueued;
+    void leaseExpiresAt;
     await this.env.KV_CACHE.put(this.jobKvKey(record), JSON.stringify(rest), {
       expirationTtl: JOB_TTL_S,
     } as any);
@@ -141,6 +146,60 @@ export class JobCoordinator {
     return { applied: true, record: next };
   }
 
+  // M1 review (Bug A). The producer commits create() BEFORE it enqueues the dispatch
+  // message, and those two durable writes are non-atomic: a send() that throws (or an
+  // isolate evicted between them) leaves the job committed as QUEUED with NO message on
+  // the queue — an orphan. Because the idempotency peek treats "a record exists" as
+  // "already handed off", such an orphan would be re-accepted (202) forever, never
+  // dispatched — the exact W1 silent-loss M1 exists to kill, reappearing on the
+  // producer side. `enqueued` is the durable proof that a hand-off was CONFIRMED; the
+  // producer sets it only AFTER a successful send, so a still-QUEUED record lacking it
+  // is a heal candidate the peek re-enqueues. Not projected to KV (internal marker).
+  private async markEnqueued(): Promise<{ record: JobRecord }> {
+    const record = await this.state.storage.get<JobRecord>(RECORD_KEY);
+    if (!record) throw new Error('markEnqueued on a job that was never created');
+    if (record.enqueued === true) return { record };
+    const next: JobRecord = { ...record, enqueued: true, updatedAt: Date.now() };
+    await this.state.storage.put(RECORD_KEY, next);
+    return { record: next };
+  }
+
+  // M1 review (Bug B). Cloudflare Queues deliver at-least-once, so the same job can be
+  // handed to a second consumer while the first is still rendering (visibility-timeout
+  // expiry during a multi-minute render, or the owner evicted mid-consume — the very
+  // eviction the Queue exists to survive). The terminal-sticky guard alone does NOT
+  // stop this: an in-flight job is DISPATCHING (non-terminal), so without a lease a
+  // redelivery would fire a SECOND GPU render (doubled spend / Denial-of-Wallet).
+  // acquireDispatch is the ATOMIC arbiter (single-threaded DO): a FRESH lease ⇒ a live
+  // delivery owns the render ⇒ 'busy' (defer). An EXPIRED lease ⇒ the owner died ⇒ take
+  // over. Terminal ⇒ 'terminal' (never re-dispatch). Lease is internal (not projected).
+  private async acquireDispatch(input: {
+    now: number;
+    leaseMs: number;
+  }): Promise<{ outcome: 'acquired' | 'busy' | 'terminal'; record: JobRecord }> {
+    const record = await this.state.storage.get<JobRecord>(RECORD_KEY);
+    if (!record) throw new Error('acquireDispatch on a job that was never created');
+    if (isTerminal(record.status)) return { outcome: 'terminal', record };
+
+    const inFlight = record.status === 'DISPATCHING' || record.status === 'PROCESSING';
+    const leaseFresh =
+      typeof record.leaseExpiresAt === 'number' && (record.leaseExpiresAt as number) > input.now;
+    if (inFlight && leaseFresh) return { outcome: 'busy', record };
+
+    // Acquire: a genuinely new (QUEUED/RETRYING) job, or takeover of an in-flight job
+    // whose owner's lease has expired. Written directly (not via transition()) so a
+    // takeover that keeps status DISPATCHING is not blocked by the state-machine edges.
+    const next: JobRecord = {
+      ...record,
+      status: 'DISPATCHING',
+      leaseExpiresAt: input.now + input.leaseMs,
+      updatedAt: input.now,
+    };
+    await this.state.storage.put(RECORD_KEY, next);
+    await this.projectToKv(next);
+    return { outcome: 'acquired', record: next };
+  }
+
   private async get(): Promise<JobRecord | null> {
     return (await this.state.storage.get<JobRecord>(RECORD_KEY)) ?? null;
   }
@@ -161,6 +220,13 @@ export class JobCoordinator {
       if (op === 'transition') {
         const { to, meta } = (await request.json()) as { to: JobStatus; meta?: Record<string, unknown> };
         return json(await this.transition(to, meta));
+      }
+      if (op === 'markEnqueued') {
+        return json(await this.markEnqueued());
+      }
+      if (op === 'acquireDispatch') {
+        const { now, leaseMs } = (await request.json()) as { now: number; leaseMs: number };
+        return json(await this.acquireDispatch({ now, leaseMs }));
       }
       if (op === 'get') {
         return json({ record: await this.get() });
@@ -211,4 +277,21 @@ export function coordinatorTransition(
 export async function coordinatorGet(stub: Fetcher): Promise<JobRecord | null> {
   const { record } = await callOp<{ record: JobRecord | null }>(stub, 'get', {});
   return record;
+}
+
+// M1 review (Bug A): confirm the durable hand-off. Called only AFTER a successful
+// JOB_DISPATCH_QUEUE.send, so a still-QUEUED record without this marker is an orphan
+// the idempotency peek must re-enqueue.
+export function coordinatorMarkEnqueued(stub: Fetcher): Promise<{ record: JobRecord }> {
+  return callOp(stub, 'markEnqueued', {});
+}
+
+// M1 review (Bug B): atomically claim the dispatch of a job (or learn it is already
+// owned/terminal). `now`/`leaseMs` are passed in so callers (runtime + tests) control
+// the clock. leaseMs must cover the worst-case render window (see handleJobQueue).
+export function coordinatorAcquireDispatch(
+  stub: Fetcher,
+  input: { now: number; leaseMs: number },
+): Promise<{ outcome: 'acquired' | 'busy' | 'terminal'; record: JobRecord }> {
+  return callOp(stub, 'acquireDispatch', input);
 }

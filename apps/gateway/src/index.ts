@@ -23,6 +23,8 @@ import {
   coordinatorCreate,
   coordinatorTransition,
   coordinatorGet,
+  coordinatorMarkEnqueued,
+  coordinatorAcquireDispatch,
   isTerminal,
   type JobStatus,
 } from './coordinator';
@@ -544,6 +546,20 @@ app.post('/api/jobs/create', async (c) => {
     // quota — mirroring the legacy "idempotency before throttle" ordering.
     const seen = await coordinatorGet(stub);
     if (seen) {
+      // Orphan heal (M1 review, Bug A). coordinatorCreate commits the DO record
+      // BEFORE the dispatch send, and those two are non-atomic: a send that fails
+      // after the commit leaves a QUEUED job that nothing will ever render. A
+      // still-QUEUED record WITHOUT the `enqueued` confirmation is exactly that
+      // orphan — re-enqueue it (the consumer's dispatch lease dedupes any redundant
+      // message, so a double-send can never cause a double GPU render).
+      if (seen.status === 'QUEUED' && seen.enqueued !== true) {
+        await c.env.JOB_DISPATCH_QUEUE.send({ deviceId, jobId: payloadObj.jobId, payload: payloadObj });
+        try {
+          await coordinatorMarkEnqueued(stub);
+        } catch {
+          /* best-effort: an unmarked-but-enqueued job just re-enqueues once more (deduped). */
+        }
+      }
       return c.json(
         {
           message: 'Job Accepted securely!',
@@ -585,6 +601,14 @@ app.post('/api/jobs/create', async (c) => {
     // Durable hand-off: the Queue consumer (handleJobQueue) drives dispatch with
     // at-least-once redelivery, so an evicted Worker can never silently lose the job.
     await c.env.JOB_DISPATCH_QUEUE.send({ deviceId, jobId: payloadObj.jobId, payload: payloadObj });
+    // Confirm the hand-off (M1 review, Bug A) so a later peek can distinguish this
+    // job from an orphan a failed send left behind. Best-effort: if the send above
+    // succeeded but this mark fails, a retry simply re-enqueues once (consumer dedupes).
+    try {
+      await coordinatorMarkEnqueued(stub);
+    } catch {
+      /* best-effort marker */
+    }
     return c.json(
       { message: 'Job Accepted securely!', jobId: payloadObj.jobId, status: 'QUEUED', etaSeconds },
       202,
@@ -1071,26 +1095,62 @@ export async function handleJobQueue(batch: MessageBatch<QueueJob>, env: Binding
     try {
       if (!env.JOB_COORDINATOR) throw new Error('JOB_COORDINATOR binding missing');
       const stub = coordinatorStub(env.JOB_COORDINATOR, deviceId, jobId);
+      const jobKey = `job:${deviceId}:${jobId}`;
 
-      // Idempotent consume: at-least-once delivery can redeliver a finished job. The
-      // DO is the authority — if it is already terminal, ACK without re-dispatching.
+      // (1) DO-terminal guard. At-least-once delivery can redeliver a finished job; if
+      // the DO authority is already terminal, ACK without re-dispatching.
       const current = await coordinatorGet(stub);
       if (current && isTerminal(current.status)) {
         message.ack();
         continue;
       }
 
-      // Mark in-flight (QUEUED→DISPATCHING; a no-op if a prior delivery already did).
-      await coordinatorTransition(stub, 'DISPATCHING');
+      // (2) KV-terminal heal (M1 review, Bug C). A prior delivery may have completed the
+      // render — committing a TERMINAL KV `job:` projection — but crashed before syncing
+      // the DO (leaving it DISPATCHING, possibly with an expired lease). Re-dispatching
+      // would burn a second GPU render AND drag the KV projection back off its terminal
+      // state (a status regression the poll contract would surface). The terminal KV is
+      // definitive proof the work finished: sync the DO to it (best-effort) and ACK.
+      const kvRec = (await env.KV_CACHE.get(jobKey, { type: 'json' })) as
+        | ({ status?: JobStatus } & Record<string, unknown>)
+        | null;
+      if (kvRec?.status && isTerminal(kvRec.status)) {
+        try {
+          await coordinatorTransition(stub, kvRec.status, kvRec);
+        } catch {
+          /* DO may be at an edge from which this heal is illegal; KV is the poll
+             authority and is already terminal, so ACK regardless of the DO sync. */
+        }
+        message.ack();
+        continue;
+      }
 
-      // Unchanged dispatch: owns the worker round-trip, Station-3 timing bounds, the
-      // in-request transient-retry loop, and the KV job:/result: projection writes.
-      // When it returns, the KV `job:` status is always terminal.
-      const jobKey = `job:${deviceId}:${jobId}`;
+      // (3) Dispatch lease (M1 review, Bug B). Atomically claim the render so a
+      // concurrent redelivery cannot fire a SECOND GPU render (doubled spend). A FRESH
+      // lease held by a live delivery ⇒ defer (retry). An EXPIRED lease ⇒ the owner died,
+      // take over. Terminal ⇒ ACK. The lease must cover the worst-case render window,
+      // including dispatchToWorker's internal transient-retry loop.
+      const maxMs = Number(env.MAX_RENDER_MS) || MAX_PLAUSIBLE_MS;
+      const leaseMs = MAX_DISPATCH_ATTEMPTS * maxMs;
+      const claim = await coordinatorAcquireDispatch(stub, { now: Date.now(), leaseMs });
+      if (claim.outcome === 'terminal') {
+        message.ack();
+        continue;
+      }
+      if (claim.outcome === 'busy') {
+        // A live delivery owns the render — defer without re-dispatching. Redelivery
+        // after the lease window lets a genuinely-dead owner be taken over.
+        message.retry();
+        continue;
+      }
+
+      // Acquired. Unchanged dispatch: owns the worker round-trip, Station-3 timing
+      // bounds, the in-request transient-retry loop, and the KV job:/result: projection
+      // writes. When it returns, the KV `job:` status is always terminal.
       await dispatchToWorker(env, payload, jobKey);
 
       // Sync the DO authority to the terminal state the dispatch landed on, so any
-      // later redelivery short-circuits at the idempotent-consume guard above.
+      // later redelivery short-circuits at the DO-terminal guard above.
       const finalKv = (await env.KV_CACHE.get(jobKey, { type: 'json' })) as
         | ({ status?: JobStatus } & Record<string, unknown>)
         | null;
