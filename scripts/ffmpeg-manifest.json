@@ -1,0 +1,25 @@
+{
+  "_comment": [
+    "Pinned FFmpeg sidecar binaries for the Tauri client (apps/client).",
+    "scripts/provision-ffmpeg.mjs verifies the on-disk sidecar against sha256 + bytes",
+    "(FAIL-CLOSED on mismatch) and can download+verify when a real 'url' is pinned.",
+    "Windows sha256/bytes/version are REAL, measured from the committed build.",
+    "macOS/Linux entries are intentionally ABSENT: adding a fabricated hash would be a",
+    "fake-green (No-Fake-Success). The script fails EXPLICITLY for any triple not listed.",
+    "Byte delivery for a fresh clone is a repo-owner decision: either (a) commit the",
+    "binary via Git LFS, or (b) set a real immutable 'url' (whose artifact hashes to the",
+    "pinned sha256). Until then a fresh checkout without the binary fails closed, honestly."
+  ],
+  "sidecarDir": "apps/client/src-tauri",
+  "sidecarBase": "ffmpeg",
+  "targets": {
+    "x86_64-pc-windows-msvc": {
+      "ext": ".exe",
+      "version": "N-124606-gdfd11985e8-20260523",
+      "source": "BtbN/FFmpeg-Builds win64-gpl master (2026-05-23); --enable-gpl --enable-version3 full-codec build",
+      "sha256": "b12e3dbaa20bed82221b07d27b4468bd155d1999a70b23f84be6749004be83c0",
+      "bytes": 204028416,
+      "url": null
+    }
+  }
+}

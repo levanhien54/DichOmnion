@@ -42,7 +42,10 @@ struct TempFileGuard {
 
 impl TempFileGuard {
     fn new(path: &str) -> Self {
-        Self { path: path.to_string(), armed: true }
+        Self {
+            path: path.to_string(),
+            armed: true,
+        }
     }
 
     /// Nhả guard: nhánh THÀNH CÔNG gọi hàm này để GIỮ file (không xóa khi drop).
@@ -179,7 +182,10 @@ fn mux_audio_to_video(video_path: String, audio_path: String) -> Result<String, 
         .map_err(|e| format!("Lỗi chạy ffmpeg: {e}"))?;
 
     if !output.status.success() {
-        return Err(format!("ffmpeg mux thất bại (mã {:?})", output.status.code()));
+        return Err(format!(
+            "ffmpeg mux thất bại (mã {:?})",
+            output.status.code()
+        ));
     }
 
     // Thành công: out_path là video đã ghép — GIỮ để lưu ra Downloads.
@@ -255,8 +261,8 @@ fn ensure_dest_in_roots(dest_path: &str, roots: &[PathBuf]) -> Result<PathBuf, S
         .parent()
         .ok_or_else(|| "Đường dẫn lưu không hợp lệ".to_string())?;
     // Thư mục cha PHẢI tồn tại thật để canonical hóa (triệt symlink/".."/"." trước khi khớp).
-    let parent_canon = std::fs::canonicalize(parent)
-        .map_err(|_| "Thư mục lưu không tồn tại".to_string())?;
+    let parent_canon =
+        std::fs::canonicalize(parent).map_err(|_| "Thư mục lưu không tồn tại".to_string())?;
     for root in roots {
         if let Ok(root_canon) = std::fs::canonicalize(root) {
             if parent_canon.starts_with(&root_canon) {
@@ -323,7 +329,10 @@ mod tests {
 
     fn unique_suffix() -> u128 {
         // std::process + thời gian: đủ để tránh đụng tên giữa các lần chạy test.
-        SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
             ^ (std::process::id() as u128)
     }
 
@@ -379,7 +388,10 @@ mod tests {
         let mut p = std::env::temp_dir();
         p.push(&name); // không tạo file
         let out = cleanup_temp_file(p.to_string_lossy().into_owned());
-        assert!(out.is_ok(), "cleanup file đã mất phải Ok (best-effort): {out:?}");
+        assert!(
+            out.is_ok(),
+            "cleanup file đã mất phải Ok (best-effort): {out:?}"
+        );
     }
 
     #[test]
@@ -398,7 +410,10 @@ mod tests {
         // TR-2 an toàn: cleanup KHÔNG được xóa file ngoài temp. Cargo.toml phải còn nguyên.
         let outside = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
         let _ = cleanup_temp_file(outside.to_string());
-        assert!(Path::new(outside).is_file(), "file ngoài temp KHÔNG được bị xóa");
+        assert!(
+            Path::new(outside).is_file(),
+            "file ngoài temp KHÔNG được bị xóa"
+        );
     }
 
     #[test]
@@ -447,7 +462,10 @@ mod tests {
         let raw = b"RIFF....WAVEfake-bytes";
         let b64 = base64::engine::general_purpose::STANDARD.encode(raw);
         let path = write_temp_audio(b64).expect("phải ghi được");
-        assert!(ensure_owned_temp_file(&path).is_ok(), "file ghi ra phải qua guard");
+        assert!(
+            ensure_owned_temp_file(&path).is_ok(),
+            "file ghi ra phải qua guard"
+        );
         let back = std::fs::read(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         assert_eq!(&back, raw, "bytes phải khớp hệt sau round-trip base64");
@@ -500,8 +518,11 @@ mod tests {
         // Đích có thư mục cha = root cho phép (dùng temp làm root để không lệ thuộc Downloads).
         let root = std::env::temp_dir();
         let dest = root.join(format!("omnivoice_dest_{}.mp4", unique_suffix()));
-        let out = ensure_dest_in_roots(&dest.to_string_lossy(), &[root.clone()]);
-        assert!(out.is_ok(), "đích trong root cho phép phải được chấp nhận: {out:?}");
+        let out = ensure_dest_in_roots(&dest.to_string_lossy(), std::slice::from_ref(&root));
+        assert!(
+            out.is_ok(),
+            "đích trong root cho phép phải được chấp nhận: {out:?}"
+        );
     }
 
     #[test]
@@ -521,8 +542,11 @@ mod tests {
         let mut traversal = root.clone();
         traversal.push("..");
         traversal.push(format!("omnivoice_evil_{}.exe", unique_suffix()));
-        let out = ensure_dest_in_roots(&traversal.to_string_lossy(), &[root.clone()]);
-        assert!(out.is_err(), "đường dẫn traversal thoát khỏi root phải bị từ chối");
+        let out = ensure_dest_in_roots(&traversal.to_string_lossy(), std::slice::from_ref(&root));
+        assert!(
+            out.is_err(),
+            "đường dẫn traversal thoát khỏi root phải bị từ chối"
+        );
     }
 
     #[test]

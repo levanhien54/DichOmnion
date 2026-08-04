@@ -36,4 +36,9 @@ Thumbs.db
 # Temp media artifacts (worker/client scratch)
 *.tmp
 dummy.mp4
+
+# Stray FFmpeg binaries stay ignored, EXCEPT the pinned Tauri sidecar under
+# src-tauri, which is committed via Git LFS (see .gitattributes +
+# scripts/provision-ffmpeg.mjs). The sidecar is checksum-verified on build.
 ffmpeg-*.exe
+!/apps/client/src-tauri/ffmpeg-*.exe

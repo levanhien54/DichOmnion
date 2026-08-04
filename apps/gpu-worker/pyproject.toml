@@ -24,10 +24,6 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = [
-    "pytest>=8.2.2",
-    "pytest-asyncio>=0.23.7"
-]
 # Bộ TĂNG CƯỜNG cho audio_engine.py — fail-soft: worker vẫn chạy nếu thiếu và báo
 # TRUNG THỰC trong `notes` (chưa tách nền / chưa watermark). Để KHÔNG ép stack nặng
 # này vào đường chạy mặc định (`uv run`), khai báo dưới dạng extra tùy chọn.
@@ -52,6 +48,15 @@ enhance = [
 local-llm = [
     "transformers>=4.51",
     "accelerate>=0.30",
+]
+
+# Nhóm phát-triển (PEP 735). KHÁC với `optional-dependencies` (extra): `uv sync`/`uv run`
+# cài nhóm này MẶC ĐỊNH, nên môi-trường-khóa tái-lập chạy được `uv run pytest` mà KHÔNG
+# cần nhớ `--extra dev`. Đây là bộ chạy test CPU chuẩn ở dev (M0: tái-lập-được).
+[dependency-groups]
+dev = [
+    "pytest>=8.2.2",
+    "pytest-asyncio>=0.23.7",
 ]
 
 [tool.pytest.ini_options]

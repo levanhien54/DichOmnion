@@ -11,8 +11,15 @@
     "build": "pnpm -r --filter=\"./packages/*\" run build",
     "test": "pnpm run test:ts && pnpm run test:py",
     "test:ts": "pnpm -r run test",
-    "test:py": "cd apps/gpu-worker && python -m pytest -q",
-    "test:py:gpu": "cd apps/gpu-worker && RUN_GPU_ACCEPT=1 python -m pytest -m gpu_acceptance -q"
+    "test:py": "cd apps/gpu-worker && uv run --frozen pytest -q",
+    "test:py:gpu": "cd apps/gpu-worker && RUN_GPU_ACCEPT=1 python -m pytest -m gpu_acceptance -q",
+    "provision:ffmpeg": "node scripts/provision-ffmpeg.mjs",
+    "verify": "pnpm run verify:packages && pnpm run verify:client && pnpm run verify:gateway && pnpm run verify:worker && pnpm run verify:rust",
+    "verify:packages": "pnpm -r --filter=\"./packages/*\" run build",
+    "verify:client": "node scripts/provision-ffmpeg.mjs --check && cd apps/client && pnpm build",
+    "verify:gateway": "cd apps/gateway && pnpm test && npx wrangler deploy --dry-run",
+    "verify:worker": "cd apps/gpu-worker && uv run --frozen pytest -q",
+    "verify:rust": "cd apps/client/src-tauri && cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test"
   },
   "devDependencies": {
     "typescript": "^5.0.0",

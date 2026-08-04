@@ -1,0 +1,78 @@
+# Minimal CI — reproduces the dev green gates from a CLEAN checkout.
+# Scope (M0): unit / type / build only. NO secrets, NO deploy, NO GPU, NO live R2.
+# Matches the local `pnpm run verify` order (packages → client → gateway → worker → Rust),
+# minus the FFmpeg sidecar checksum gate: the 195 MB sidecar is NOT in a clean checkout
+# (byte-delivery is a repo-owner decision — Git LFS or a pinned URL), and the JS build
+# (`tsc && vite build`) does not need it. The Tauri bundle step (which does) is out of
+# minimal-CI scope. Runs on windows-latest to match the dev box's locked env (torch CPU
+# wheel from PyPI); Linux would pull the CUDA userspace wheels the lock carries for it.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install JS deps (frozen)
+        run: pnpm install --frozen-lockfile
+
+      - name: Build packages
+        run: pnpm run verify:packages
+
+      - name: Client — tsc + vite build
+        working-directory: apps/client
+        run: pnpm build
+
+      - name: Gateway — vitest + wrangler dry-run
+        working-directory: apps/gateway
+        run: |
+          pnpm test
+          npx wrangler deploy --dry-run
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.11"
+
+      - name: Worker — locked env is reproducible (lock check + frozen sync)
+        working-directory: apps/gpu-worker
+        run: |
+          uv lock --check
+          uv sync --frozen
+
+      - name: Worker — pytest (CPU suite; gpu_acceptance deselected)
+        working-directory: apps/gpu-worker
+        run: uv run --frozen pytest -q
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Client (Rust) — fmt + clippy + test
+        working-directory: apps/client/src-tauri
+        run: |
+          cargo fmt --check
+          cargo clippy --all-targets -- -D warnings
+          cargo test
