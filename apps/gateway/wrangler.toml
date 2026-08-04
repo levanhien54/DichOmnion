@@ -13,6 +13,40 @@ account_id = "385e2b411beb41a79d6b45477bc3f544"
 binding = "KV_CACHE"
 id = "local-kv-id-for-dev"
 
+# --- M1 (ADR 0001): điều phối job BỀN VỮNG (Durable Object + Queue) ----------
+# JobCoordinator Durable Object = nguồn-sự-thật NGUYÊN TỬ cho vòng đời mỗi job (một
+# instance cho mỗi <deviceId>:<jobId>). Queue `job-dispatch` = bàn giao BỀN VỮNG để
+# Worker bị evict giữa chừng KHÔNG BAO GIỜ âm thầm mất job (consumer được redeliver).
+# CẢ HAI cần gói Workers TRẢ PHÍ để DEPLOY; chạy MIỄN PHÍ cục bộ dưới `wrangler dev`
+# (Miniflare) và hợp lệ dưới `wrangler deploy --dry-run`. TRƯỚC deploy thật (Track A):
+#   cd apps/gateway && wrangler queues create job-dispatch
+#   cd apps/gateway && wrangler queues create job-dispatch-dlq
+# (DO được cấp phát bởi [[migrations]] tag dưới đây ở lần deploy đầu — không cần lệnh CLI.)
+[[durable_objects.bindings]]
+name = "JOB_COORDINATOR"
+class_name = "JobCoordinator"
+
+# DO cổ điển (dựa trên fetch) → new_classes (KHÔNG phải new_sqlite_classes). Chỉ THÊM
+# nên an toàn với compatibility_date hiện tại; chỉ tăng tag khi đổi schema về sau.
+[[migrations]]
+tag = "v1"
+new_classes = ["JobCoordinator"]
+
+# Producer handle mà POST /api/jobs/create dùng để enqueue message dispatch.
+[[queues.producers]]
+binding = "JOB_DISPATCH_QUEUE"
+queue = "job-dispatch"
+
+# Consumer = handler `.queue` của Worker (handleJobQueue). Mỗi lần một job
+# (max_batch_size = 1) để cô lập một lượt dispatch GPU nặng; message hỏng CATASTROPHIC
+# lặp lại sẽ vào DLQ sau max_retries thay vì lặp vô hạn.
+[[queues.consumers]]
+queue = "job-dispatch"
+max_batch_size = 1
+max_batch_timeout = 5
+max_retries = 5
+dead_letter_queue = "job-dispatch-dlq"
+
 # --- Biến cấu hình công khai (đặt trong [vars] hoặc Dashboard) ---------------
 [vars]
 # URL của GPU worker riêng (chỉ Gateway gọi tới). Mặc định loopback cho dev cục bộ.

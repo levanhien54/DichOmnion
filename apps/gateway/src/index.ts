@@ -15,9 +15,26 @@ import {
   MAX_SEGMENT_META_CHARS,
   MAX_JOBID_CHARS,
 } from './limits';
+// M1 (ADR 0001) — durable job coordination. JobCoordinator is the atomic source of
+// truth (per-(device,job) Durable Object); the Queue consumer drives dispatch with
+// durable redelivery. Re-export the DO class at the bottom so wrangler can bind it.
+import {
+  JobCoordinator,
+  coordinatorCreate,
+  coordinatorTransition,
+  coordinatorGet,
+  isTerminal,
+  type JobStatus,
+} from './coordinator';
 
 type Bindings = {
   KV_CACHE: KVNamespace;
+  // M1 (ADR 0001) — Durable Object namespace for JobCoordinator (atomic job state)
+  // and the producer handle for the durable dispatch Queue. Both are OPTIONAL on the
+  // type so the many existing tests that build a KV-only env keep type-checking; the
+  // /create producer path degrades gracefully when they are absent (see below).
+  JOB_COORDINATOR?: DurableObjectNamespace;
+  JOB_DISPATCH_QUEUE?: Queue<QueueJob>;
   // Station 2 (asymmetric): PKCS8 PEM of the gateway's ES256 (P-256) PRIVATE key.
   // Provided as a Wrangler secret. The Worker holds only the matching PUBLIC key.
   GATEWAY_JWT_PRIVATE_KEY?: string;
@@ -500,8 +517,84 @@ app.post('/api/jobs/create', async (c) => {
     return c.json({ error: `Job input too large: ${sizeError}` }, 400);
   }
 
-  // Idempotency: a re-sent job returns the existing record, never double-dispatches.
   const jobKey = `job:${deviceId}:${payloadObj.jobId}`;
+  const etaSeconds = estimateEtaSeconds(payloadObj);
+
+  // Đợt 17 F5 per-device job-creation throttle config (shared by both dispatch
+  // paths). Bounds a registered-but-untrusted device from spinning up unlimited
+  // real GPU renders. The quota is consumed only for GENUINELY NEW jobIds — a
+  // client retrying the SAME job (returned below as idempotent) never counts.
+  const jobsLimit = Number(c.env.JOBS_RATE_LIMIT) || JOBS_RATE_LIMIT;
+  const jobsWindow = Number(c.env.JOBS_WINDOW_S) || JOBS_WINDOW_S;
+  const jobsRlKey = `rl:jobs:${deviceId}`;
+
+  // ── M1 (ADR 0001): DURABLE dispatch path ─────────────────────────────────
+  // When the JobCoordinator DO + dispatch Queue are bound (production, wired in
+  // wrangler.toml), the DO is the ATOMIC source of truth and the Queue is the
+  // durable hand-off. This replaces the fragile `202 + waitUntil` dispatch:
+  //   • W1 — an evicted Worker can no longer silently drop the job (the Queue
+  //          redelivers to the consumer instead of a fire-and-forget waitUntil);
+  //   • W3 — DO.create is an atomic check-and-set, ending the KV get-then-put
+  //          TOCTOU that could double-dispatch a re-sent jobId.
+  // Absent the bindings we fall through to the legacy KV + background path below.
+  if (c.env.JOB_COORDINATOR && c.env.JOB_DISPATCH_QUEUE) {
+    const stub = coordinatorStub(c.env.JOB_COORDINATOR, deviceId, payloadObj.jobId);
+
+    // Repeat? A re-sent job returns its CURRENT state (read-only) and consumes no
+    // quota — mirroring the legacy "idempotency before throttle" ordering.
+    const seen = await coordinatorGet(stub);
+    if (seen) {
+      return c.json(
+        {
+          message: 'Job Accepted securely!',
+          jobId: payloadObj.jobId,
+          status: seen.status,
+          etaSeconds: seen.etaSeconds,
+          idempotent: true,
+        },
+        202,
+      );
+    }
+
+    // Genuinely new → throttle (CHECK only; the quota is consumed AFTER we confirm
+    // WE created the record, so a lost race neither enqueues nor charges quota).
+    const jobsCount = parseInt((await c.env.KV_CACHE.get(jobsRlKey)) || '0', 10);
+    if (jobsCount >= jobsLimit) {
+      return c.json({ error: 'Too Many Jobs. Rate limit exceeded; please try again later.' }, 429);
+    }
+
+    // Atomic check-and-set (W3 fix). Also seeds the KV `job:` projection to QUEUED
+    // so the existing poll/download contract keeps reading KV unchanged.
+    const created = await coordinatorCreate(stub, { deviceId, jobId: payloadObj.jobId, etaSeconds });
+    if (created.idempotent) {
+      // Lost a concurrent race for the same jobId — the winner enqueued & charged
+      // quota; we must not double-dispatch (no double GPU render).
+      return c.json(
+        {
+          message: 'Job Accepted securely!',
+          jobId: payloadObj.jobId,
+          status: created.record.status,
+          etaSeconds: created.record.etaSeconds,
+          idempotent: true,
+        },
+        202,
+      );
+    }
+
+    await c.env.KV_CACHE.put(jobsRlKey, String(jobsCount + 1), { expirationTtl: jobsWindow });
+    // Durable hand-off: the Queue consumer (handleJobQueue) drives dispatch with
+    // at-least-once redelivery, so an evicted Worker can never silently lose the job.
+    await c.env.JOB_DISPATCH_QUEUE.send({ deviceId, jobId: payloadObj.jobId, payload: payloadObj });
+    return c.json(
+      { message: 'Job Accepted securely!', jobId: payloadObj.jobId, status: 'QUEUED', etaSeconds },
+      202,
+    );
+  }
+
+  // ── Legacy path (no durable bindings): KV idempotency + background dispatch ──
+  // A real, still-functional fallback (the pre-M1 behavior). Production binds the
+  // DO + Queue, so this runs only in KV-only environments (e.g. the existing unit
+  // tests). Idempotency: a re-sent job returns the existing record, never re-dispatches.
   const existing = await c.env.KV_CACHE.get<{ status: string; etaSeconds?: number }>(jobKey, { type: 'json' });
   if (existing) {
     return c.json(
@@ -516,20 +609,12 @@ app.post('/api/jobs/create', async (c) => {
     );
   }
 
-  // Đợt 17 F5: per-device job-creation throttle. Checked AFTER idempotency so a
-  // client retrying the SAME job after a network blip (returned above as idempotent)
-  // never consumes quota — only GENUINELY NEW jobIds count against the window. Bounds
-  // a registered-but-untrusted device from spinning up unlimited real GPU renders.
-  const jobsLimit = Number(c.env.JOBS_RATE_LIMIT) || JOBS_RATE_LIMIT;
-  const jobsWindow = Number(c.env.JOBS_WINDOW_S) || JOBS_WINDOW_S;
-  const jobsRlKey = `rl:jobs:${deviceId}`;
   const jobsCount = parseInt((await c.env.KV_CACHE.get(jobsRlKey)) || '0', 10);
   if (jobsCount >= jobsLimit) {
     return c.json({ error: 'Too Many Jobs. Rate limit exceeded; please try again later.' }, 429);
   }
   await c.env.KV_CACHE.put(jobsRlKey, String(jobsCount + 1), { expirationTtl: jobsWindow });
 
-  const etaSeconds = estimateEtaSeconds(payloadObj);
   await c.env.KV_CACHE.put(
     jobKey,
     JSON.stringify({ status: 'QUEUED', createdAt: Date.now(), etaSeconds }),
@@ -960,5 +1045,76 @@ async function terminateWorker(env: Bindings, workerUrl: string, jobId: string, 
     // Worker may already be gone; the quarantine flag is the durable signal.
   }
 }
+
+// --- M1: durable dispatch Queue consumer (ADR 0001) ------------------------
+// The message a /create producer enqueues. The full payload rides the message so
+// the consumer can dispatch without a second read; input size is already bounded by
+// validateJobSize (well under the 128 KiB queue-message limit).
+export interface QueueJob {
+  deviceId: string;
+  jobId: string;
+  payload: JobRequest;
+}
+
+/** Resolve the JobCoordinator DO stub for one (device, job). One object per pair. */
+function coordinatorStub(ns: DurableObjectNamespace, deviceId: string, jobId: string) {
+  return ns.get(ns.idFromName(`${deviceId}:${jobId}`));
+}
+
+/** Queue consumer: the durable replacement for `background(dispatchToWorker)` in
+ *  `waitUntil`. On Worker eviction mid-consume the message is NOT acked, so the Queue
+ *  redelivers it — a job can never be silently lost (the core W1 fix). The DO's
+ *  terminal-sticky state makes at-least-once redelivery idempotent. */
+export async function handleJobQueue(batch: MessageBatch<QueueJob>, env: Bindings): Promise<void> {
+  for (const message of batch.messages) {
+    const { deviceId, jobId, payload } = message.body;
+    try {
+      if (!env.JOB_COORDINATOR) throw new Error('JOB_COORDINATOR binding missing');
+      const stub = coordinatorStub(env.JOB_COORDINATOR, deviceId, jobId);
+
+      // Idempotent consume: at-least-once delivery can redeliver a finished job. The
+      // DO is the authority — if it is already terminal, ACK without re-dispatching.
+      const current = await coordinatorGet(stub);
+      if (current && isTerminal(current.status)) {
+        message.ack();
+        continue;
+      }
+
+      // Mark in-flight (QUEUED→DISPATCHING; a no-op if a prior delivery already did).
+      await coordinatorTransition(stub, 'DISPATCHING');
+
+      // Unchanged dispatch: owns the worker round-trip, Station-3 timing bounds, the
+      // in-request transient-retry loop, and the KV job:/result: projection writes.
+      // When it returns, the KV `job:` status is always terminal.
+      const jobKey = `job:${deviceId}:${jobId}`;
+      await dispatchToWorker(env, payload, jobKey);
+
+      // Sync the DO authority to the terminal state the dispatch landed on, so any
+      // later redelivery short-circuits at the idempotent-consume guard above.
+      const finalKv = (await env.KV_CACHE.get(jobKey, { type: 'json' })) as
+        | ({ status?: JobStatus } & Record<string, unknown>)
+        | null;
+      if (finalKv?.status) {
+        await coordinatorTransition(stub, finalKv.status, finalKv);
+      }
+      message.ack();
+    } catch {
+      // Catastrophic failure (DO/KV unreachable, Worker evicted mid-consume). Do NOT
+      // ack — let the Queue redeliver so the job survives (durable retry `waitUntil`
+      // could never provide). Zero-Logging: never print payload/url/token.
+      console.error('[queue] dispatch consume failed; will redeliver');
+      message.retry();
+    }
+  }
+}
+
+// Serve BOTH roles from the one Worker: `.fetch` (the Hono router) and `.queue`
+// (the dispatch consumer). Tests keep importing the default app and using .request;
+// the runtime additionally invokes .queue for the job-dispatch consumer.
+(app as unknown as { queue: typeof handleJobQueue }).queue = handleJobQueue;
+
+// Re-export the Durable Object class so wrangler's [[durable_objects.bindings]] +
+// [[migrations]] can find it as a named export on the Worker entrypoint.
+export { JobCoordinator };
 
 export default app;
