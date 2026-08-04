@@ -172,7 +172,7 @@ class ModelManager:
         if not self.is_loaded:
             raise RuntimeError("Models chưa được nạp lên VRAM!")
 
-        from src.audio_service import audio_service
+        from src.audio_service import audio_service, AudioIntegrityError
         from src.audio_engine import audio_engine
 
         # Ràng buộc TOÀN VẸN NỘI DUNG (fail-closed): object key R2 dùng chung cho mọi job/bản
@@ -182,7 +182,9 @@ class ModelManager:
         # tải-về với vé và fail-closed khi lệch. Biến rò rỉ chéo tenant thành từ chối an toàn.
         expected_md5 = (config.get("audio_md5") or "").strip()
         if not expected_md5:
-            raise RuntimeError("Thiếu md5 toàn vẹn audio — từ chối job (fail-closed).")
+            # Đợt 33 CC33-01: thiếu md5 là lỗi XÁC ĐỊNH của payload (không tự khỏi khi retry)
+            # -> AudioIntegrityError -> main.py trả 422 (terminal), không để Gateway retry.
+            raise AudioIntegrityError("Thiếu md5 toàn vẹn audio — từ chối job (fail-closed).")
 
         import os
 

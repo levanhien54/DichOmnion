@@ -888,6 +888,26 @@ Ngoài 7 nhóm Critical, các hạng mục sau (từ Mục 5 khuyến nghị) đ
 
 **Ranh-giới residual (KHÔNG giả-xanh, Track-A):** harness `gwverify.mjs` **đã có** chế-độ `--real-r2` (mint→PUT bytes WAV thật→GET→so-byte, fail-loud `exit 4` khi thiếu/cred-dummy) — nhưng round-trip **THẬT** vẫn **chặn ở người dùng**: cần tạo **S3 API token** (Dashboard → R2 → Manage R2 API Tokens → Object Read & Write trên `sonsonjh`) rồi đặt **đúng 2 dòng** `R2_ACCESS_KEY_ID`/`R2_SECRET_ACCESS_KEY` vào `apps/gateway/.dev.vars` (nhập bí-mật là hành-vi BỊ CẤM với trợ-lý). RH1–RH11 nguyên-vẹn; Đợt 32 **không** đụng nhóm phần-cứng đó.
 
+### Đợt 33 (2026-07-27) — Vòng rà-soát R2 **thứ hai** (chuyển sink sang **worker↔gateway**) — CC33-01
+
+> **Phân loại:** vòng rà-soát-đối-kháng có mục-tiêu thứ hai trên khối R2 Option A (nối tiếp Đợt 32), **không** đảo tuyên-bố HỘI-TỤ K=2 (Đợt 26/27). **5 finder đa-lăng-kính** (SigV4/canonical-path · auth/tenant/replay · fail-closed/logging · client-contract · **worker↔gateway integrity-flow**) → **mỗi phát-hiện bị verifier phản-bác mặc-định-bác-bỏ**. Kết-quả: **4 lăng-kính KHÔ (dry)** (gồm cả sibling deviceId path-injection — sạch), **1 XÁC-NHẬN nhất-trí** (cả 2 verifier CONFIRMED): **CC33-01**.
+
+**Phát-hiện & xử-lý:**
+
+| # | Phát hiện | Verdict | Vì sao vòng cũ bỏ sót | Sửa / Ghi-nhận | Kiểm-chứng |
+|---|---|---|---|---|---|
+| **CC33-01** *(No-Fake-Success / amplification)* | Lỗi TOÀN-VẸN audio **XÁC-ĐỊNH** bị trả **HTTP 500** → Gateway **retry tải lại**. `download_audio` (audio_service.py) raise `RuntimeError` khi **bytes lệch md5** đã ký; guard **thiếu md5** (model_manager.py) cũng raise `RuntimeError`; cả hai chạy **lúc runtime** trong `process_job` → `process_audio` bắt bằng `except Exception` → **500** (main.py). Gateway (index.ts:848) coi **5xx là thoáng-qua** → `RETRYING` + `continue` tới `MAX_DISPATCH_ATTEMPTS=3` lần, **mỗi lần re-download tối đa 1 GiB** — khuếch-đại băng-thông/độ-trễ mà **không bao giờ thành-công** (tải lại CÙNG object hỏng y hệt). Trái với các lỗi XÁC-ĐỊNH **anh-em** (segment/UTF/jobId) vốn là **pydantic `@field_validator`** chạy lúc **parse** → FastAPI auto-**422** (4xx = terminal, không retry). Kiểm md5 **không thể** là validator (cần **bytes đã tải**), nên phải phân-loại ở tầng handler. | **CONFIRMED** (2/2 verifier, refute-default). Xác-minh end-to-end qua nguồn: raise-site → 500 → `index.ts:848` `status>=500 && attempt<MAX` → `continue`. | Khối R2 mới (Đợt 30-32); các vòng Đợt 17-25 gác input **anh-em** ở sink **pydantic parse-time** (tự-động 422). Sink **integrity runtime** (chạy SAU parse, trong `process_job`) **chưa** ai soi — nó là con đường **duy-nhất** biến lỗi xác-định thành 5xx. `vitest` (gateway) mock worker; `pytest` (worker) chỉ khẳng-định `RuntimeError` (không khẳng-định **mã HTTP**) → không lộ. | Thêm **`AudioIntegrityError(RuntimeError)`** (audio_service.py) — **kế-thừa** RuntimeError nên mọi `except RuntimeError`/`pytest.raises(RuntimeError)` cũ vẫn xanh. Raise nó tại **cả 2** sink xác-định (md5 lệch: audio_service.py; thiếu md5: model_manager.py), **re-raise NGUYÊN LOẠI** qua except-wrapper chung của `download_audio` (nếu không sẽ bị bọc lại thành RuntimeError phẳng). `process_audio` **ánh-xạ nó → HTTPException(422)** TRƯỚC `except Exception`. **Ranh-giới đối-xứng giữ nguyên:** lỗi **thoáng-qua** (rớt mạng → RuntimeError phẳng) **vẫn 500** (retry) — không gộp nhầm lỗi hồi-phục-được thành terminal. Zero-Logging: detail 422 chỉ nêu bản-chất, không lộ url/md5/nội-dung. | **TDD**: 3 test RED (`download` md5-lệch→`AudioIntegrityError` ✗; `process_job` thiếu-md5→`AudioIntegrityError` ✗; endpoint tích-hợp→**500≠422** ✗) → sau fix **xanh**; +1 guard đối-xứng (RuntimeError thoáng-qua **giữ 500**). |
+
+**Xanh Đợt 33 (chạy TƯƠI 2026-07-27, sau fix CC33-01):**
+
+| Suite | Lệnh | Kết quả |
+|---|---|---|
+| Worker (pytest CPU) | `python -m pytest` | **232 passed, 1 skipped** (gpu_acceptance default-skip), 4 deselected — gồm 4 test CC33-01 mới; các test md5 cũ (`pytest.raises(RuntimeError)`) **vẫn xanh** (AudioIntegrityError **is-a** RuntimeError) |
+
+*(Không chạy lại `vitest`/`tsc`/`wrangler dry-run`/`vite build`/`cargo test` đợt này: thay-đổi **CHỈ nằm trong `apps/gpu-worker/src` (Python: main.py, model_manager.py, audio_service.py) + 2 file test worker**. Gateway đã **sẵn** phân-loại 4xx-terminal/5xx-retry đúng (index.ts:848) nên **KHÔNG** đổi mã gateway — 145 vitest gateway độc-lập logic, mốc xanh gần nhất Đợt 32. Nêu trung-thực thay vì ngầm-hiểu "đã chạy".)*
+
+**Ranh-giới residual (KHÔNG giả-xanh, Track-A):** CC33-01 sửa **hành-vi mã** (mã HTTP → phân-loại retry) — đã kiểm đầy-đủ trên CPU. Round-trip R2 **THẬT** và GPU acceptance vẫn **chặn ở người dùng** (S3 API token thật + `wrangler secret put` + deploy live). RH1–RH11 nguyên-vẹn; Đợt 33 **không** đụng nhóm phần-cứng đó.
+
 ### B.5 — G-03 & G-05 — Ranh giới kiến trúc/hạ tầng (khai báo trung thực)
 
 Hai phát hiện này **không thể "sửa hết trong mã ứng dụng"** — chúng là ranh giới **kiến trúc/phần cứng**. Ghi rõ ở đây để không bị hiểu là "âm thầm bỏ qua"; cả hai đều đã **giảm thiểu tối đa trong tầng logic** và phần dư nêu trung thực.

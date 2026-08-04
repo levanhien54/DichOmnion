@@ -13,6 +13,7 @@ from contextlib import asynccontextmanager
 import jwt
 
 from src.model_manager import ModelManager
+from src.audio_service import AudioIntegrityError
 from src.timecode import to_seconds
 
 # Khởi tạo Quản lý Mô hình AI (singleton, thường trú VRAM)
@@ -381,6 +382,16 @@ async def process_audio(
         return {"job_id": payload.job_id, "result": result}
     except HTTPException:
         raise
+    except AudioIntegrityError:
+        # Đợt 33 CC33-01: bytes audio lệch/thiếu md5 đã ký là lỗi XÁC ĐỊNH — tải lại CÙNG
+        # object sẽ hỏng y hệt. Trả 422 (4xx) để Gateway (index.ts) đánh FAILED TERMINAL,
+        # KHÔNG coi là 5xx thoáng qua rồi retry tải lại tối đa 1 GiB × MAX_DISPATCH_ATTEMPTS
+        # (khuếch đại băng thông/độ trễ mà không bao giờ thành công). Zero-Logging: chỉ nêu
+        # bản chất, không lộ url/md5/nội dung.
+        raise HTTPException(
+            status_code=422,
+            detail="Audio tải về không toàn vẹn (md5 lệch hoặc thiếu) — từ chối (fail-closed).",
+        )
     except Exception as e:
         # WORKER_DEBUG (chỉ bật trên hộp GPU của dev): in traceback ĐẦY ĐỦ ra STDERR của
         # tiến trình worker để chẩn đoán. KHÔNG BAO GIỜ đi vào HTTP response / KV / client —

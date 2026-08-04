@@ -11,6 +11,16 @@ from urllib.parse import urlparse
 logger = logging.getLogger("omnivoice.audio")
 logger.setLevel(logging.WARNING)
 
+
+# Đợt 33 CC33-01 — lỗi TOÀN VẸN audio là lỗi XÁC ĐỊNH (deterministic), tách khỏi lỗi
+# THOÁNG QUA (mạng rớt). Kế thừa RuntimeError để mọi handler `except RuntimeError` cũ (và
+# test pytest.raises(RuntimeError)) vẫn bắt được — nhưng LOẠI riêng cho phép main.py phân
+# biệt: bytes lệch md5 / thiếu md5 sẽ hỏng Y HỆT khi tải lại cùng object, nên process_audio
+# ánh xạ nó thành HTTP 422 (4xx = terminal ở Gateway) thay vì 500 (5xx = bị retry tải lại
+# tối đa 1 GiB × MAX_DISPATCH_ATTEMPTS — khuếch đại vô ích). Lỗi mạng thoáng qua vẫn 500 (retry).
+class AudioIntegrityError(RuntimeError):
+    """Bytes audio tải-về không thỏa ràng buộc toàn vẹn md5 (lệch hoặc thiếu vé md5)."""
+
 # --- Cổng chống SSRF cho audio_url (do CLIENT kiểm soát) ---------------------------
 # audio nguồn LÀ presigned URL CÔNG KHAI tới R2 (xem apps/client/src/lib/transport.ts
 # và CSP client: https://*.r2.cloudflarestorage.com / *.r2.dev). URL này client tự KÝ
@@ -161,13 +171,18 @@ class AudioService:
                         # Zero-Logging: KHÔNG log URL/md5/nội dung. Chỉ nêu bản chất sự cố để
                         # operator phân biệt "object bị ghi đè" với lỗi mạng thường.
                         logger.warning("Audio md5 không khớp — nghi object bị ghi đè (fail-closed).")
-                        raise RuntimeError("audio tải về không khớp md5 đã ký — từ chối (fail-closed).")
+                        raise AudioIntegrityError("audio tải về không khớp md5 đã ký — từ chối (fail-closed).")
 
                 fd, path = tempfile.mkstemp(suffix=".wav", dir=self.temp_dir)
                 with os.fdopen(fd, 'wb') as f:
                     f.write(content)
                 logger.info("Đã tải thành công file audio.")
                 return path
+        except AudioIntegrityError:
+            # Đợt 33 CC33-01: lỗi toàn vẹn là XÁC ĐỊNH — KHÔNG để except-wrapper bên dưới bọc
+            # lại thành RuntimeError chung (mất loại) rồi bị Gateway retry tải lại vô ích. Đã
+            # log warning sanitized ngay tại chỗ raise; re-raise NGUYÊN LOẠI để main.py -> 422.
+            raise
         except Exception as e:
             # Zero-Logging: không log URL (có thể chứa token đã ký). Chỉ log loại lỗi.
             logger.error(f"Lỗi tải audio: {type(e).__name__}")

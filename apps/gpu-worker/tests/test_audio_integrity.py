@@ -236,3 +236,44 @@ async def test_process_job_fails_closed_without_md5(monkeypatch):
     }
     with pytest.raises(RuntimeError, match="md5"):
         await mgr.process_job("https://pub-abc.r2.dev/a.wav", config)
+
+
+# --- Đợt 33 CC33-01: lỗi TOÀN VẸN là XÁC ĐỊNH -> phải mang loại RIÊNG (AudioIntegrityError) ---
+# Lý do: hai lỗi md5 (bytes lệch / thiếu md5) là lỗi KHÔNG BAO GIỜ tự khỏi khi tải lại
+# CÙNG object. Nếu chúng đội LỐT RuntimeError chung như lỗi mạng thoáng qua, main.py phải
+# trả 500 -> Gateway (index.ts) coi 5xx là thoáng qua và RETRY tới MAX_DISPATCH_ATTEMPTS lần,
+# mỗi lần tải lại tối đa 1 GiB (khuếch đại băng thông/độ trễ mà không bao giờ thành công).
+# Một loại lỗi RIÊNG cho phép main.py phân biệt "xác định" -> 422 (terminal) với "thoáng
+# qua" -> 500 (retry). AudioIntegrityError kế thừa RuntimeError nên các test cũ vẫn xanh.
+
+def test_download_mismatched_md5_raises_audio_integrity_error(monkeypatch, tmp_path):
+    """Bytes tải-về lệch md5 đã ký -> AudioIntegrityError (KHÔNG bị bọc lại thành RuntimeError
+    chung bởi except-wrapper cuối download_audio). Đây là lỗi XÁC ĐỊNH: tải lại cùng object
+    sẽ lệch y hệt -> Gateway phải đánh terminal, không retry."""
+    victim_bytes = b"PRIVATE audio of another tenant"
+    signed_md5 = hashlib.md5(b"what THIS job actually uploaded").hexdigest()
+    _install_fake_http(monkeypatch, victim_bytes)
+    monkeypatch.setattr(audio_service, "temp_dir", str(tmp_path))
+
+    with pytest.raises(audio_mod.AudioIntegrityError):
+        audio_service.download_audio("https://pub-abc.r2.dev/a.wav", signed_md5)
+
+
+async def test_process_job_missing_md5_raises_audio_integrity_error(monkeypatch):
+    """process_job THIẾU audio_md5 -> AudioIntegrityError (loại RIÊNG, không RuntimeError
+    chung). Thiếu md5 là lỗi XÁC ĐỊNH của payload -> Gateway phải đánh terminal, không retry."""
+    from src.model_manager import ModelManager
+
+    mgr = ModelManager()
+    monkeypatch.setattr(mgr, "is_loaded", True)
+
+    config = {
+        "target_language": "Vietnamese",
+        "style": "Formal",
+        "segments": [{"text": "x"}],
+        "voice_map": {},
+        "source_language": "en",
+        # audio_md5 CỐ TÌNH thiếu.
+    }
+    with pytest.raises(audio_mod.AudioIntegrityError):
+        await mgr.process_job("https://pub-abc.r2.dev/a.wav", config)

@@ -109,6 +109,65 @@ def test_worker_forwards_voice_map_and_source_language(mock_model_manager):
     )
 
 
+# ── Đợt 33 CC33-01: mã trạng thái phân loại retry của Gateway ──────────────────────
+# Gateway (index.ts:848) coi 5xx là lỗi worker THOÁNG QUA -> RE-DISPATCH tới
+# MAX_DISPATCH_ATTEMPTS lần; 4xx là lỗi XÁC ĐỊNH -> terminal, KHÔNG retry. Một lỗi toàn
+# vẹn audio (md5 lệch/thiếu) là XÁC ĐỊNH: tải lại cùng object hỏng y hệt. Nếu worker trả
+# 500 cho nó, Gateway retry 3 lần, mỗi lần tải lại tối đa 1 GiB — khuếch đại băng thông/độ
+# trễ mà không bao giờ thành công. Worker phải trả 422 để biến nó thành terminal.
+
+def test_process_returns_422_on_audio_integrity_failure(mock_model_manager):
+    """AudioIntegrityError (md5 lệch/thiếu — lỗi XÁC ĐỊNH) -> 422, KHÔNG 500.
+    422 là 4xx -> Gateway đánh FAILED terminal, không khuếch đại retry tải lại."""
+    from unittest.mock import AsyncMock
+    from src.audio_service import AudioIntegrityError
+    from src.main import verify_gateway_jwt
+
+    mock_model_manager.process_job = AsyncMock(
+        side_effect=AudioIntegrityError("audio tải về không khớp md5 đã ký — từ chối (fail-closed).")
+    )
+    app.dependency_overrides[verify_gateway_jwt] = lambda: {
+        "role": "gateway", "jobId": "JOB-INTEGRITY",
+    }
+    try:
+        resp = client.post("/api/worker/process", json={
+            "job_id": "JOB-INTEGRITY",
+            "audio_url": "http://a.wav",
+            "target_language": "Vietnamese",
+            "translation_style": "Formal",
+            "segments": [],
+        })
+        assert resp.status_code == 422
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_process_returns_500_on_transient_failure(mock_model_manager):
+    """Ranh giới đối xứng của CC33-01: lỗi KHÔNG xác định (rớt mạng thoáng qua -> RuntimeError
+    chung) PHẢI vẫn là 500 để Gateway RETRY. Gộp nhầm lỗi thoáng qua vào 422 sẽ biến một job
+    lẽ ra hồi phục được thành FAILED vĩnh viễn."""
+    from unittest.mock import AsyncMock
+    from src.main import verify_gateway_jwt
+
+    mock_model_manager.process_job = AsyncMock(
+        side_effect=RuntimeError("Không thể tải audio từ URL đã cung cấp.")
+    )
+    app.dependency_overrides[verify_gateway_jwt] = lambda: {
+        "role": "gateway", "jobId": "JOB-TRANSIENT",
+    }
+    try:
+        resp = client.post("/api/worker/process", json={
+            "job_id": "JOB-TRANSIENT",
+            "audio_url": "http://a.wav",
+            "target_language": "Vietnamese",
+            "translation_style": "Formal",
+            "segments": [],
+        })
+        assert resp.status_code == 500
+    finally:
+        app.dependency_overrides.clear()
+
+
 def test_process_without_jwt_rejected(mock_model_manager):
     """TQG-4 (Trạm 2): Gửi thẳng job vào worker mà KHÔNG có JWT của Gateway.
 
