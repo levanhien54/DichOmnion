@@ -338,9 +338,16 @@ def _default_factory(code: str, cache_dir: str) -> _NeMoNormalizer:
                 raise
     except TextPreprocessingConfigurationError:
         raise
-    except Exception:
+    except Exception as exc:
         # Pynini exceptions can contain cache paths, grammar internals, or the
-        # validation input. Keep the public failure stable and sanitized.
+        # validation input. Keep the public failure stable and sanitized. The
+        # exception class is bounded diagnostic metadata and never includes the
+        # input, cache path, model URL, or secret-bearing exception message.
+        logger.warning(
+            "nemo_grammar_build_failed language=%s error_type=%s",
+            code,
+            type(exc).__name__,
+        )
         raise TextPreprocessingUnavailableError(
             f"NVIDIA NeMo grammar is unavailable for language '{code}'"
         ) from None
