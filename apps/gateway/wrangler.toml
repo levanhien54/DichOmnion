@@ -26,11 +26,71 @@ id = "local-kv-id-for-dev"
 name = "JOB_COORDINATOR"
 class_name = "JobCoordinator"
 
+# --- M3-S4 (Zero-Trust siết đầu-cuối): ReplayGuard = kho nonce NHẤT-QUÁN-MẠNH ------
+# Một instance cho mỗi thiết bị (idFromName("nonce:<deviceId>")) đảm bảo mỗi nonce đã ký
+# chỉ DÙNG MỘT LẦN trong cửa sổ ±30s → chặn phát-lại (replay) một request đã ký nguyên
+# văn. PHẢI là Durable Object (đơn-luồng ⇒ check-and-set NGUYÊN TỬ, nhất-quán-mạnh);
+# KHÔNG dùng KV (nhất-quán-cuối-cùng có thể bỏ sót nonce vừa ghi ở PoP khác). Cấp phát
+# qua [[migrations]] tag v2 dưới đây ở lần deploy — không cần lệnh CLI.
+[[durable_objects.bindings]]
+name = "REPLAY_GUARD"
+class_name = "ReplayGuard"
+
+# --- M3-S5 (Bug D): RateLimiter = throttle NGUYÊN TỬ cho register/job/presign ------
+# Một instance cho mỗi khoá rate-limit (idFromName("rl:jobs:<deviceId>", "rl:register:<ip>",
+# "rl:presign:<deviceId>")). Thay KV get-then-put (TOCTOU: một loạt request đọc cùng count
+# rồi ĐỀU qua → vượt trần → Denial-of-Wallet) bằng check-AND-consume NGUYÊN TỬ (DO đơn-luồng
+# ⇒ đọc-sửa-ghi bản ghi {resetAt,count} bất khả phân). KHÔNG dùng KV (nhất-quán-cuối-cùng có
+# thể bỏ sót increment ở PoP khác). Cấp phát qua [[migrations]] tag v3 dưới đây — không cần CLI.
+[[durable_objects.bindings]]
+name = "RATE_LIMITER"
+class_name = "RateLimiter"
+
+# --- M3-S6: KillSwitch = trạng thái Financial Kill Switch NHẤT-QUÁN-MẠNH -----------
+# MỘT shard toàn cục (idFromName("system")) = một công tắc cho CẢ dịch vụ. Trước đây là cờ
+# KV (`system:kill_switch`) — KV nhất-quán-cuối-cùng: bật ở PoP này có thể chưa thấy ở PoP
+# khác trong vài giây, đúng cửa sổ một đợt Denial-of-Wallet lợi dụng. DO đơn-luồng, mọi PoP
+# route về CÙNG instance ⇒ một lần bật thấy NGAY khắp nơi (không dùng KV nhất-quán-cuối cho
+# quyết định tài chính). readKillSwitch/setKillSwitch tự degrade về cờ KV khi binding vắng
+# (env test/ pre-migration). Cấp phát qua [[migrations]] tag v4 dưới đây — không cần lệnh CLI.
+[[durable_objects.bindings]]
+name = "KILL_SWITCH"
+class_name = "KillSwitch"
+
+# Dynamic RunPod target registry. A single strong-consistent shard serializes the exclusive
+# controller lease, generation-ordered heartbeats, and the kill-switch control block. A delayed
+# or competing process cannot resume/publish over the current Worker generation.
+[[durable_objects.bindings]]
+name = "WORKER_TARGET_REGISTRY"
+class_name = "WorkerTargetRegistry"
+
 # DO cổ điển (dựa trên fetch) → new_classes (KHÔNG phải new_sqlite_classes). Chỉ THÊM
 # nên an toàn với compatibility_date hiện tại; chỉ tăng tag khi đổi schema về sau.
 [[migrations]]
 tag = "v1"
 new_classes = ["JobCoordinator"]
+
+# M3-S4: THÊM class ReplayGuard. Migration mới (KHÔNG sửa v1 đã cấp phát) — chỉ thêm
+# một DO class nên an toàn với compatibility_date hiện tại.
+[[migrations]]
+tag = "v2"
+new_classes = ["ReplayGuard"]
+
+# M3-S5: THÊM class RateLimiter. Migration mới (KHÔNG sửa v1/v2 đã cấp phát) — chỉ thêm
+# một DO class cổ điển (dựa trên fetch) nên an toàn với compatibility_date hiện tại.
+[[migrations]]
+tag = "v3"
+new_classes = ["RateLimiter"]
+
+# M3-S6: THÊM class KillSwitch. Migration mới (KHÔNG sửa v1/v2/v3 đã cấp phát) — chỉ thêm
+# một DO class cổ điển (dựa trên fetch) nên an toàn với compatibility_date hiện tại.
+[[migrations]]
+tag = "v4"
+new_classes = ["KillSwitch"]
+
+[[migrations]]
+tag = "v5"
+new_classes = ["WorkerTargetRegistry"]
 
 # Producer handle mà POST /api/jobs/create dùng để enqueue message dispatch.
 [[queues.producers]]
@@ -47,18 +107,40 @@ max_batch_timeout = 5
 max_retries = 5
 dead_letter_queue = "job-dispatch-dlq"
 
+# --- M2-S5d: CRON cho ORPHAN SWEEPER ----------------------------------------
+# `.scheduled` (handleScheduled trong index.ts) chạy sweepOrphans: dọn object R2 sống
+# lâu hơn job của nó (input job đã terminal mà xoá hụt, attempt render thua, input mà
+# job không bao giờ được tạo) trong khi BẢO VỆ artifact thắng + mọi object của job còn
+# sống. Mỗi giờ một lần. Cron chạy THẬT cần Worker đã deploy (Track A) → BLOCKED_EXTERNAL;
+# cục bộ kích thủ công bằng: wrangler dev --test-scheduled  rồi  curl "localhost:8787/__scheduled".
+[triggers]
+crons = ["0 * * * *"]
+
 # --- Biến cấu hình công khai (đặt trong [vars] hoặc Dashboard) ---------------
 [vars]
-# URL của GPU worker riêng (chỉ Gateway gọi tới). Mặc định loopback cho dev cục bộ.
-# PRODUCTION: Worker nằm sau Cloudflare Tunnel (cloudflared) -> đặt WORKER_URL = URL tunnel
-# (vd https://worker-xxxx.trycloudflare.com hoặc hostname tunnel đã đặt). Worker KHÔNG mở
-# IP public; tunnel là đường vào riêng duy nhất. Xem docs/DEPLOYMENT.md (Track A, bước tunnel).
-WORKER_URL = "http://127.0.0.1:8000"
+# WORKER_URL is intentionally absent here. Configure it per environment in the
+# Cloudflare dashboard only as a static fallback, or in .dev.vars for loopback development.
+# A live RunPod controller heartbeat overrides it. This prevents a production deploy from
+# silently probing its own empty localhost while allowing automatic Pod URL rotation.
+# The authenticated readiness probe is bounded and shared with the voice catalog.
+WORKER_CAPABILITY_TIMEOUT_MS = "3500"
+WORKER_CAPABILITY_CACHE_MS = "1000"
 # Danh sách origin client được phép (CORS). KHÔNG dùng "*".
-ALLOWED_ORIGINS = "tauri://localhost,https://tauri.localhost,http://localhost:1420,http://localhost:5173"
+ALLOWED_ORIGINS = "tauri://localhost,https://tauri.localhost,http://localhost:1420,http://localhost:5173,http://127.0.0.1:5173"
 # Ngưỡng thời gian Trạm 3 (tùy chọn, có mặc định trong code):
 # MIN_PLAUSIBLE_MS = "2000"
 # MAX_RENDER_MS = "900000"
+# RunPod public proxy: keep MAX_RENDER_MS <= 90000 and enable the short-request
+# ANALYZE protocol only after deploying a worker image that implements it.
+# ASYNC_ANALYZE_ENABLED = "true"
+# ASYNC_ANALYZE_TIMEOUT_MS = "900000"
+# ASYNC_ANALYZE_POLL_MS = "2500"
+# Retention/sweeper (milliseconds). Defaults: orphan grace 1h, current Analyze artifact
+# và approved manifest 7 ngày. Superseded approved hash vẫn được giữ ít nhất MAX_RENDER_MS
+# + consumer grace để không xóa dưới một Render đang chạy.
+# ORPHAN_MIN_AGE_MS = "3600000"
+# ARTIFACT_RETENTION_MS = "604800000"
+# APPROVED_RETENTION_MS = "604800000"
 # Trần kích thước job — phản chiếu trần worker (tùy chọn, có mặc định trong code).
 # GIỮ COMMENT: bỏ comment = ghi giá trị vào [vars] và ĐỔI runtime limit.
 # MAX_SEGMENTS = "2000"
@@ -77,6 +159,17 @@ ALLOWED_ORIGINS = "tauri://localhost,https://tauri.localhost,http://localhost:14
 # nạp qua `wrangler secret put`); mở sẵn để tránh quên uncomment lúc deploy → presign 503 oan.
 R2_ACCOUNT_ID = "385e2b411beb41a79d6b45477bc3f544"
 R2_BUCKET = "sonsonjh"
+
+# M2 — NATIVE R2 binding to the SAME bucket named by R2_BUCKET above. The presign vars
+# (SigV4) let the client/worker read+write R2 from OUTSIDE the Worker; this binding lets
+# the Gateway itself operate on the bucket (delete a job's input after it is terminal,
+# HEAD-verify a result before DONE, sweep orphans) without threading query-credentials
+# through KV/DO. Local `wrangler dev` simulates this via Miniflare R2; the LIVE bucket
+# round-trip needs real R2 credentials (BLOCKED_EXTERNAL). Bucket must already exist:
+#   cd apps/gateway && wrangler r2 bucket create sonsonjh
+[[r2_buckets]]
+binding = "R2"
+bucket_name = "sonsonjh"
 # Tuỳ chọn (có mặc định trong code): R2_REGION="auto", R2_PRESIGN_EXPIRES_S="7200" (max 604800),
 # PRESIGN_RATE_LIMIT="60", PRESIGN_WINDOW_S="3600".
 # R2_REGION = "auto"
@@ -91,8 +184,10 @@ R2_BUCKET = "sonsonjh"
 #                             scripts/gen-gateway-keys.sh
 #                           (public SPKI PEM -> đặt vào GATEWAY_JWT_PUBLIC_KEY của worker)
 # TURNSTILE_SECRET        : Secret key Cloudflare Turnstile (chống bot khi đăng ký).
-# ADMIN_TOKEN             : Bí mật chia sẻ cho watchdog Financial Kill Switch
-#                           (apps/gateway/scripts/kill-switch-monitor.mjs) gọi /api/admin/kill-switch.
+# ADMIN_TOKEN             : Bí mật riêng cho watchdog Financial Kill Switch.
+# WORKER_TARGET_ADMIN_TOKEN: Bí mật riêng cho RunPod SDK controller acquire lease/publish/clear target.
+#                            Không dùng chung hai secret vì controller không được quyền tắt
+#                            chốt chi phí.
 # R2_ACCESS_KEY_ID        : Access Key ID của R2 S3 API token (Object Read & Write).
 # R2_SECRET_ACCESS_KEY    : Secret Access Key tương ứng — Gateway ký SigV4 cho /api/uploads/presign.
 #                           Tạo token: Dashboard → R2 → Manage R2 API Tokens.

@@ -20,9 +20,23 @@ GATEWAY_JWT_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----
 # Secret Cloudflare Turnstile (đi cặp với VITE_TURNSTILE_SITE_KEY của Client) — chống bot khi đăng ký.
 TURNSTILE_SECRET="<Turnstile secret key>"
 
-# Bí mật chia sẻ bảo vệ endpoint quản trị POST /api/admin/kill-switch (watchdog Financial Kill
-# Switch: apps/gateway/scripts/kill-switch-monitor.mjs gửi header X-Admin-Token trùng giá trị này).
-ADMIN_TOKEN="<shared secret cho kill-switch>"
+# Tách secret theo quyền: watchdog chỉ được điều khiển Financial Kill Switch; RunPod controller
+# chỉ được xin lease/publish/clear worker target. Không nhập hai giá trị này vào ứng dụng desktop.
+ADMIN_TOKEN="<shared secret cho kill-switch watchdog>"
+WORKER_TARGET_ADMIN_TOKEN="<shared secret riêng cho RunPod controller>"
+
+# Static GPU Worker fallback. A live SDK-controller heartbeat takes precedence. Plain HTTP is
+# accepted only for loopback development; every remote URL must use HTTPS and no credentials.
+WORKER_URL="http://127.0.0.1:8000"
+WORKER_CAPABILITY_TIMEOUT_MS="3500"
+WORKER_CAPABILITY_CACHE_MS="1000"
+# RunPod proxy deployments must keep this at or below 90000 (90 seconds).
+MAX_RENDER_MS="90000"
+# Long ANALYZE jobs use short authenticated submit/status requests. Enable only
+# after the deployed worker image exposes /api/worker/analyze/submit and /status.
+ASYNC_ANALYZE_ENABLED="true"
+ASYNC_ANALYZE_TIMEOUT_MS="900000"
+ASYNC_ANALYZE_POLL_MS="2500"
 
 # --- R2 (object storage cho AUDIO) — cho POST /api/uploads/presign ------------------
 # Gateway KÝ presigned R2 URL mỗi job (Option A). Client gọi /api/uploads/presign, Gateway
@@ -30,7 +44,8 @@ ADMIN_TOKEN="<shared secret cho kill-switch>"
 # Thiếu bất kỳ biến BẮT BUỘC nào bên dưới → endpoint FAIL-CLOSED 503 (không bịa URL giả).
 # PRODUCTION: nạp bằng `wrangler secret put <TÊN>` (ACCESS_KEY/SECRET là BÍ MẬT — đừng commit).
 #   R2 → S3 API token: Cloudflare Dashboard → R2 → Manage R2 API Tokens → tạo token có
-#   quyền Object Read & Write trên bucket; lấy Access Key ID + Secret Access Key.
+#   quyền Object Read & Write trên bucket; lấy Access Key ID 32 ký tự + Secret Access Key
+#   64 ký tự. Không dùng nhầm Cloudflare API Token làm S3 Access Key ID.
 R2_ACCOUNT_ID="385e2b411beb41a79d6b45477bc3f544"   # mã tài khoản Cloudflare → host <id>.r2.cloudflarestorage.com
 R2_BUCKET="sonsonjh"                                # tên bucket R2 chứa audio job
 R2_ACCESS_KEY_ID="<R2 S3 Access Key ID>"            # BÍ MẬT (dev có thể để placeholder)

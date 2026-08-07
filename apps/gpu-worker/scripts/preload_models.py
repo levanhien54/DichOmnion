@@ -267,6 +267,23 @@ def _resolved_snapshot_revision(model_id: str, requested_revision: str | None) -
             if ref.stat().st_size > 80:
                 raise RuntimeError("A model cache reference is invalid.")
             revision = ref.read_text(encoding="ascii").strip().lower()
+        except FileNotFoundError as exc:
+            # Some Hugging Face loaders (notably WhisperX/pyannote) materialize
+            # a content-addressed snapshot but omit refs/main. Accept that
+            # layout only when there is exactly one valid snapshot: this keeps
+            # startup deterministic and still fails closed on an ambiguous or
+            # partially hydrated cache.
+            snapshots = repo_cache / "snapshots"
+            candidates = sorted(
+                path.name
+                for path in snapshots.iterdir()
+                if path.is_dir() and _HF_COMMIT_RE.fullmatch(path.name)
+            ) if snapshots.is_dir() else []
+            if len(candidates) != 1:
+                raise RuntimeError(
+                    "A model cache is missing its resolved Hugging Face revision."
+                ) from exc
+            revision = candidates[0]
         except (OSError, UnicodeError) as exc:
             raise RuntimeError(
                 "A model cache is missing its resolved Hugging Face revision."
