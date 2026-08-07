@@ -320,6 +320,10 @@ WORKER_ANALYZE_RESPONSE_SCHEMA_VERSION = 1
 ANALYZE_RESULT_SCHEMA_VERSION = 1
 WORKER_VOICE_CAPABILITIES_SCHEMA_VERSION = 1
 WORKER_READINESS_SCHEMA_VERSION = 1
+# Liveness is deliberately separate from readiness.  A long ANALYZE/RENDER holds the
+# single GPU slot and may temporarily make the full dependency probe return 503, while
+# the process and resident CUDA models remain healthy enough to finish that job.
+WORKER_LIVENESS_SCHEMA_VERSION = 1
 
 # M3-S10: MIRROR của packages/shared-types/src/index.ts FAILURE_REASONS.INTERNAL_ERROR.
 # Mã lỗi ĐÃ SANITIZE, cố định — là token DUY NHẤT được phép đi vào HTTP response khi
@@ -1640,6 +1644,34 @@ async def health():
         content=response,
         status_code=200 if readiness["ready"] else 503,
     )
+
+
+@app.get("/api/worker/liveness")
+async def worker_liveness():
+    """Return a bounded process/GPU liveness signal for the RunPod controller.
+
+    ``/health`` remains the strict readiness gate for accepting new work.  During a
+    long async job that gate can legitimately be 503 (for example while the local
+    TTS sidecar is occupied), so the controller needs a separate signal before it
+    decides to clear a previously published target.  This endpoint performs no
+    sidecar/network/model load and exposes only fixed-shape booleans/enums.
+    """
+    snapshot = await asyncio.to_thread(_model_health_snapshot)
+    active_jobs = sum(
+        1 for task in _active_gpu_tasks() if not task.done()
+    )
+    quarantined = bool(WORKER_STATE["quarantined"])
+    models_loaded = bool(
+        snapshot.get("core_ready") is True and snapshot.get("device") == "cuda"
+    )
+    alive = not quarantined and models_loaded
+    return {
+        "schema_version": WORKER_LIVENESS_SCHEMA_VERSION,
+        "status": "ok" if alive else "not_ready",
+        "models_loaded": models_loaded,
+        "device": snapshot.get("device", "unknown"),
+        "busy": active_jobs > 0,
+    }
 
 
 @app.post("/api/worker/terminate")
