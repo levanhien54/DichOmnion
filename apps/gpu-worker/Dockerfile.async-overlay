@@ -6,6 +6,26 @@
 ARG BASE_IMAGE=lethtihuy/dichomnion-worker@sha256:1f0f7144d6e9b17c321f6e99c841078290c51c43a65d3d6a38df40c722e741b5
 FROM ${BASE_IMAGE}
 
+# The accepted base digest predates the NeMo text-processing dependency. Install the
+# audited Linux wheels in the patch layer so the worker's required TN policy is real;
+# `--no-deps` avoids pulling an unpinned resolver graph or the optional cdifflib C
+# extension used only by NeMo audio-based utilities. All normalizer dependencies are
+# pinned to the lockfile versions below.
+USER root
+RUN /app/.venv/bin/python -m pip install --no-cache-dir --disable-pip-version-check --no-deps \
+    pynini==2.1.6.post1 \
+    nemo-text-processing==1.2.0 \
+    editdistance==0.8.1 \
+    inflect==7.5.0 \
+    joblib==1.5.3 \
+    regex==2026.7.19 \
+    sacremoses==0.1.1 \
+    wget==3.2 \
+    wrapt==2.3.0 \
+    more-itertools==11.1.0 \
+    typeguard==4.6.0 \
+    six==1.17.0
+
 USER 10001:10001
 WORKDIR /app
 COPY --chown=10001:10001 src ./src
