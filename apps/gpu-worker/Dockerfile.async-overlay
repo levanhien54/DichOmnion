@@ -7,24 +7,32 @@ ARG BASE_IMAGE=lethtihuy/dichomnion-worker@sha256:1f0f7144d6e9b17c321f6e99c84107
 FROM ${BASE_IMAGE}
 
 # The accepted base digest predates the NeMo text-processing dependency. Install the
-# audited Linux wheels in the patch layer so the worker's required TN policy is real;
-# `--no-deps` avoids pulling an unpinned resolver graph or the optional cdifflib C
-# extension used only by NeMo audio-based utilities. All normalizer dependencies are
-# pinned to the lockfile versions below.
+# audited Linux wheels in the patch layer so the worker's required TN policy is real.
+# NeMo declares cdifflib as a runtime dependency, so compile its pinned extension in
+# this layer and remove the compiler again before publishing. The build also constructs
+# the Vietnamese grammar once; a dependency or Pynini ABI mismatch therefore fails the
+# image build instead of consuming a RunPod during startup.
 USER root
-RUN uv pip install --python /app/.venv/bin/python --no-cache --no-deps \
-    pynini==2.1.6.post1 \
-    nemo-text-processing==1.2.0 \
-    editdistance==0.8.1 \
-    inflect==7.5.0 \
-    joblib==1.5.3 \
-    regex==2026.7.19 \
-    sacremoses==0.1.1 \
-    wget==3.2 \
-    wrapt==2.3.0 \
-    more-itertools==11.1.0 \
-    typeguard==4.6.0 \
-    six==1.17.0
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends build-essential python3.12-dev \
+    && uv pip install --python /app/.venv/bin/python --no-cache --no-deps \
+        pynini==2.1.6.post1 \
+        nemo-text-processing==1.2.0 \
+        cdifflib==1.2.9 \
+        editdistance==0.8.1 \
+        inflect==7.5.0 \
+        joblib==1.5.3 \
+        regex==2026.7.19 \
+        sacremoses==0.1.1 \
+        wget==3.2 \
+        wrapt==2.3.0 \
+        more-itertools==11.1.0 \
+        typeguard==4.6.0 \
+        six==1.17.0 \
+    && /app/.venv/bin/python -c "from nemo_text_processing.text_normalization.normalize import Normalizer; n = Normalizer(input_case='cased', lang='vi', deterministic=True, cache_dir='/tmp/nemo-vi-smoke', overwrite_cache=True, post_process=True); assert n.normalize('12', verbose=False, punct_pre_process=False, punct_post_process=False).strip()" \
+    && rm -rf /tmp/nemo-vi-smoke \
+    && apt-get purge -y --auto-remove build-essential python3.12-dev \
+    && rm -rf /var/lib/apt/lists/*
 
 USER 10001:10001
 WORKDIR /app

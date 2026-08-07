@@ -274,7 +274,12 @@ def _default_factory(code: str, cache_dir: str) -> _NeMoNormalizer:
     _silence_nemo_logging()
     try:
         from nemo_text_processing.text_normalization.normalize import Normalizer
-    except (ImportError, ModuleNotFoundError):
+    except (ImportError, ModuleNotFoundError) as exc:
+        logger.warning(
+            "nemo_import_failed language=%s error_type=%s",
+            code,
+            type(exc).__name__,
+        )
         raise TextPreprocessingUnavailableError(
             "NVIDIA NeMo Text Processing is not installed"
         ) from None
@@ -437,7 +442,12 @@ class TextPreprocessingService:
                 normalizer = self._factory(code, self.cache_dir)
                 if not callable(getattr(normalizer, "normalize", None)):
                     raise TypeError("invalid NeMo normalizer")
-            except Exception:
+            except Exception as exc:
+                logger.warning(
+                    "nemo_normalizer_unavailable language=%s error_type=%s",
+                    code,
+                    type(exc).__name__,
+                )
                 self._unavailable.add(code)
                 if self.required:
                     raise TextPreprocessingUnavailableError(
