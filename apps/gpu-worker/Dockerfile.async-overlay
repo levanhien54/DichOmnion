@@ -12,7 +12,7 @@ FROM ${BASE_IMAGE}
 # extension used only by NeMo audio-based utilities. All normalizer dependencies are
 # pinned to the lockfile versions below.
 USER root
-RUN /app/.venv/bin/python -m pip install --no-cache-dir --disable-pip-version-check --no-deps \
+RUN uv pip install --python /app/.venv/bin/python --no-cache --no-deps \
     pynini==2.1.6.post1 \
     nemo-text-processing==1.2.0 \
     editdistance==0.8.1 \
