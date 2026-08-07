@@ -75,4 +75,38 @@ class ASRService:
             logger.error(f"Lỗi bóc băng: {type(e).__name__}")
             raise
 
+    def transcribe_analyze(self, audio_path: str) -> Dict[str, Any]:
+        """Bóc băng cho bước ANALYZE (Human-in-the-Loop): trả về ngôn ngữ GỐC phát hiện
+        được + segments KÈM tín hiệu ĐỘ TIN CẬY thô của mô hình (avg_logprob, no_speech_prob).
+
+        Khác `transcribe` (đường render một-lượt cũ, chỉ cần text + mốc thời gian): người
+        biên tập cần thấy câu nào mô hình KHÔNG chắc để soát tay. Ta SURFACE trực tiếp tín
+        hiệu của faster-whisper thay vì bịa hằng số 'confidence' (No-Fake-Success). Diarization
+        thật (WhisperX) tới ở S7 — tại đây mọi câu tạm gán SPEAKER_UNKNOWN (degraded)."""
+        if not self.is_loaded or self.model is None:
+            raise RuntimeError("Faster Whisper model is not loaded yet!")
+
+        logger.info(f"Bắt đầu bóc băng (analyze) file: {audio_path}")
+        try:
+            segments, info = self.model.transcribe(audio_path, beam_size=5)
+
+            results = []
+            for idx, segment in enumerate(segments):
+                results.append({
+                    "id": f"sub-{idx+1}",
+                    "start": round(segment.start, 2),
+                    "end": round(segment.end, 2),
+                    "text": segment.text.strip(),
+                    # Tín hiệu ĐỘ TIN CẬY thô của mô hình — surfaced verbatim, không bịa.
+                    "avg_logprob": segment.avg_logprob,
+                    "no_speech_prob": segment.no_speech_prob,
+                    "speaker": "SPEAKER_UNKNOWN",  # diarization thật ở S7
+                })
+
+            return {"language": info.language, "segments": results}
+        except Exception as e:
+            # Zero-Logging: chỉ log TÊN loại lỗi (đường dẫn temp có thể nằm trong message).
+            logger.error(f"Lỗi bóc băng (analyze): {type(e).__name__}")
+            raise
+
 asr_service = ASRService()

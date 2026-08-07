@@ -1,0 +1,12 @@
+# syntax=docker/dockerfile:1
+
+# Small production patch image for the async ANALYZE transport. The base is the
+# already accepted linux/amd64 worker image; only application code changes, so a
+# remote builder does not need to rebuild the large CUDA/PyTorch dependency graph.
+ARG BASE_IMAGE=lethtihuy/dichomnion-worker@sha256:1f0f7144d6e9b17c321f6e99c841078290c51c43a65d3d6a38df40c722e741b5
+FROM ${BASE_IMAGE}
+
+USER 10001:10001
+WORKDIR /app
+COPY --chown=10001:10001 src ./src
+COPY --chown=10001:10001 scripts ./scripts

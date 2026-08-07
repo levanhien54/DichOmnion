@@ -1,0 +1,357 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://omnivoice.invalid/schemas/m7-benchmark-report-v1.json",
+  "title": "OmniVoice M7 benchmark report v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "generated_at_utc",
+    "scenario",
+    "measurement_status",
+    "blocked_reason",
+    "evidence",
+    "claims",
+    "input",
+    "hardware",
+    "software",
+    "models",
+    "model_revision_coverage",
+    "execution",
+    "stage_latency_ms",
+    "gpu_memory",
+    "runs"
+  ],
+  "properties": {
+    "schema": {"const": "omnivoice.m7-benchmark.v1"},
+    "generated_at_utc": {"type": "string", "format": "date-time"},
+    "scenario": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$"},
+    "measurement_status": {"enum": ["completed", "failed", "blocked"]},
+    "blocked_reason": {"type": ["string", "null"]},
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["gpu", "report_scope"],
+      "properties": {
+        "gpu": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "reason"],
+          "properties": {
+            "status": {"enum": ["measured", "unavailable", "incomplete"]},
+            "reason": {"type": "string"}
+          }
+        },
+        "report_scope": {"const": "measurement_only"}
+      }
+    },
+    "claims": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["gpu_acceptance", "kpi_evaluated", "reason"],
+      "properties": {
+        "gpu_acceptance": {"const": false},
+        "kpi_evaluated": {"const": false},
+        "reason": {"const": "separate_acceptance_policy_required"}
+      }
+    },
+    "input": {"$ref": "#/$defs/inputMetadata"},
+    "hardware": {"$ref": "#/$defs/hardware"},
+    "software": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["packages"],
+      "properties": {
+        "packages": {
+          "type": "object",
+          "additionalProperties": {"type": ["string", "null"]}
+        }
+      }
+    },
+    "models": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 64,
+      "items": {"$ref": "#/$defs/model"}
+    },
+    "model_revision_coverage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["resolved", "total", "complete"],
+      "properties": {
+        "resolved": {"type": "integer", "minimum": 0, "maximum": 64},
+        "total": {"type": "integer", "minimum": 1, "maximum": 64},
+        "complete": {"type": "boolean"}
+      }
+    },
+    "execution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "requested_warmups",
+        "requested_iterations",
+        "completed_warmups",
+        "completed_iterations",
+        "percentile_method"
+      ],
+      "properties": {
+        "requested_warmups": {"type": "integer", "minimum": 0, "maximum": 100},
+        "requested_iterations": {"type": "integer", "minimum": 1, "maximum": 100},
+        "completed_warmups": {"type": "integer", "minimum": 0, "maximum": 100},
+        "completed_iterations": {"type": "integer", "minimum": 0, "maximum": 100},
+        "percentile_method": {"const": "Hyndman-Fan type 7"}
+      }
+    },
+    "stage_latency_ms": {
+      "type": "object",
+      "patternProperties": {
+        "^[a-z][a-z0-9_-]{0,63}$": {"$ref": "#/$defs/summary"}
+      },
+      "additionalProperties": false,
+      "maxProperties": 65
+    },
+    "gpu_memory": {"$ref": "#/$defs/gpuMemorySummary"},
+    "runs": {
+      "type": "array",
+      "maxItems": 100,
+      "items": {"$ref": "#/$defs/run"}
+    }
+  },
+  "$defs": {
+    "inputMetadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "media_kind",
+        "duration_ms",
+        "size_bytes",
+        "sha256",
+        "speaker_count",
+        "languages",
+        "sample_rate_hz",
+        "channels"
+      ],
+      "properties": {
+        "media_kind": {"enum": ["audio", "video"]},
+        "duration_ms": {"type": "integer", "minimum": 1, "maximum": 86400000},
+        "size_bytes": {"type": "integer", "minimum": 1, "maximum": 21474836480},
+        "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+        "speaker_count": {"type": "integer", "minimum": 1, "maximum": 64},
+        "languages": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"type": "string", "pattern": "^[A-Za-z][A-Za-z -]{0,31}$"}
+        },
+        "sample_rate_hz": {"type": ["integer", "null"], "minimum": 8000, "maximum": 384000},
+        "channels": {"type": ["integer", "null"], "minimum": 1, "maximum": 32}
+      }
+    },
+    "hardware": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "os",
+        "os_release",
+        "architecture",
+        "logical_cpu_count",
+        "python_version",
+        "gpus",
+        "nvidia_driver_version",
+        "cuda_runtime_version",
+        "torch_version"
+      ],
+      "properties": {
+        "os": {"type": "string"},
+        "os_release": {"type": "string"},
+        "architecture": {"type": "string"},
+        "logical_cpu_count": {"type": ["integer", "null"], "minimum": 1},
+        "python_version": {"type": "string"},
+        "gpus": {
+          "type": "array",
+          "maxItems": 8,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "memory_total_bytes", "driver_version"],
+            "properties": {
+              "name": {"type": "string"},
+              "memory_total_bytes": {"type": "integer", "minimum": 1},
+              "driver_version": {"type": "string"}
+            }
+          }
+        },
+        "nvidia_driver_version": {"type": ["string", "null"]},
+        "cuda_runtime_version": {"type": ["string", "null"]},
+        "torch_version": {"type": ["string", "null"]}
+      }
+    },
+    "model": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["component", "model_id", "revision", "revision_evidence"],
+      "properties": {
+        "component": {
+          "type": "string",
+          "maxLength": 64,
+          "pattern": "^[A-Za-z][A-Za-z0-9_-]{0,63}$"
+        },
+        "model_id": {
+          "type": "string",
+          "maxLength": 256,
+          "pattern": "^(?:hf://)?[A-Za-z0-9][A-Za-z0-9._-]{0,127}(?:/[A-Za-z0-9][A-Za-z0-9._-]{0,127})?$"
+        },
+        "revision": {
+          "anyOf": [
+            {
+              "type": "string",
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$"
+            },
+            {"type": "null"}
+          ]
+        },
+        "revision_evidence": {
+          "enum": ["source_pin", "declared_runtime_snapshot", "unresolved"]
+        }
+      }
+    },
+    "summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sample_count", "min", "mean", "p50", "p90", "p95", "p99", "max"],
+      "properties": {
+        "sample_count": {"type": "integer", "minimum": 1, "maximum": 100},
+        "min": {"type": "number", "minimum": 0},
+        "mean": {"type": "number", "minimum": 0},
+        "p50": {"type": "number", "minimum": 0},
+        "p90": {"type": "number", "minimum": 0},
+        "p95": {"type": "number", "minimum": 0},
+        "p99": {"type": "number", "minimum": 0},
+        "max": {"type": "number", "minimum": 0}
+      }
+    },
+    "gpuMetric": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "source",
+        "scope",
+        "device_count",
+        "sample_interval_ms",
+        "capacity_bytes",
+        "baseline_used_bytes",
+        "final_used_bytes",
+        "peak_used_bytes",
+        "stages"
+      ],
+      "properties": {
+        "schema_version": {"const": 1},
+        "source": {"const": "nvidia-smi"},
+        "scope": {"const": "visible_devices_total"},
+        "device_count": {"type": "integer", "minimum": 1, "maximum": 8},
+        "sample_interval_ms": {"type": "integer", "minimum": 50, "maximum": 5000},
+        "capacity_bytes": {"type": "integer", "minimum": 1},
+        "baseline_used_bytes": {"type": "integer", "minimum": 0},
+        "final_used_bytes": {"type": "integer", "minimum": 0},
+        "peak_used_bytes": {"type": "integer", "minimum": 0},
+        "stages": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "stage",
+              "start_used_bytes",
+              "peak_used_bytes",
+              "end_used_bytes",
+              "sample_count"
+            ],
+            "properties": {
+              "stage": {"type": "string", "pattern": "^[a-z][a-z0-9_-]{0,63}$"},
+              "start_used_bytes": {"type": "integer", "minimum": 0},
+              "peak_used_bytes": {"type": "integer", "minimum": 0},
+              "end_used_bytes": {"type": "integer", "minimum": 0},
+              "sample_count": {"type": "integer", "minimum": 2}
+            }
+          }
+        }
+      }
+    },
+    "runMemory": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["command_envelope", "stage_detail", "stage_detail_source"],
+      "properties": {
+        "command_envelope": {"$ref": "#/$defs/gpuMetric"},
+        "stage_detail": {"anyOf": [{"$ref": "#/$defs/gpuMetric"}, {"type": "null"}]},
+        "stage_detail_source": {"enum": ["child_observation", "command_envelope"]}
+      }
+    },
+    "gpuMemorySummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "reason",
+        "scope",
+        "capacity_bytes",
+        "baseline_used_bytes",
+        "final_used_bytes",
+        "peak_used_bytes",
+        "stage_peak_used_bytes"
+      ],
+      "properties": {
+        "status": {"enum": ["measured", "unavailable"]},
+        "reason": {"type": "string"},
+        "scope": {"const": "visible_devices_total"},
+        "device_count": {"type": "integer", "minimum": 1, "maximum": 8},
+        "capacity_bytes": {"type": ["integer", "null"], "minimum": 1},
+        "baseline_used_bytes": {"anyOf": [{"$ref": "#/$defs/summary"}, {"type": "null"}]},
+        "final_used_bytes": {"anyOf": [{"$ref": "#/$defs/summary"}, {"type": "null"}]},
+        "peak_used_bytes": {"anyOf": [{"$ref": "#/$defs/summary"}, {"type": "null"}]},
+        "stage_peak_used_bytes": {
+          "type": "object",
+          "patternProperties": {
+            "^[a-z][a-z0-9_-]{0,63}$": {"$ref": "#/$defs/summary"}
+          },
+          "additionalProperties": false,
+          "maxProperties": 64
+        }
+      }
+    },
+    "run": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "index",
+        "outcome",
+        "exit_code",
+        "error_code",
+        "stage_latencies_ms",
+        "gpu_memory"
+      ],
+      "properties": {
+        "kind": {"enum": ["warmup", "measurement"]},
+        "index": {"type": "integer", "minimum": 1, "maximum": 100},
+        "outcome": {"enum": ["success", "failed"]},
+        "exit_code": {"type": ["integer", "null"]},
+        "error_code": {"type": ["string", "null"]},
+        "stage_latencies_ms": {
+          "type": "object",
+          "minProperties": 1,
+          "maxProperties": 65,
+          "patternProperties": {
+            "^[a-z][a-z0-9_-]{0,63}$": {"type": "number", "minimum": 0}
+          },
+          "additionalProperties": false
+        },
+        "gpu_memory": {"$ref": "#/$defs/runMemory"}
+      }
+    }
+  }
+}

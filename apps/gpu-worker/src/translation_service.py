@@ -3,11 +3,21 @@ import json
 import re
 import math
 import logging
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Literal
 
 from pydantic import BaseModel, Field, ValidationError
 
 from src.timecode import to_seconds
+from src.translation_quality import (
+    estimate_spoken_duration_seconds,
+    quality_gate_metadata,
+    quality_gate_segments,
+    normalize_translation_text,
+    score_translation,
+    speech_unit_count,
+    timing_overflow_penalty,
+)
+from src.qwen_prompt_profiles import build_qwen_system_prompt
 
 # ZERO-LOGGING (tiêu chí #2): logger ở mức WARNING và TUYỆT ĐỐI không đưa prompt /
 # văn bản gốc / bản dịch vào bất kỳ mức log nào. Chỉ log METADATA (đếm segment, số
@@ -27,44 +37,93 @@ VALID_EMOTIONS = frozenset(
 # Số lần thử tối đa khi mô hình trả JSON/không đúng schema (TRANSLATION_RULES.md §4).
 MAX_TRANSLATION_ATTEMPTS = 3
 
-# ── SELF-REVIEW (Qwen TỰ CHẤM ĐIỂM + TỰ CHỈNH SỬA) ──────────────────────────────────
-# Sau khi vòng dịch ban đầu cho ra bản HỢP LỆ, Qwen tự soi lại bản dịch của chính mình
-# và viết gọn lại những câu LỆCH NHỊP. Cơ chế dùng HAI tín hiệu TÁCH BẠCH (No-Fake-Success):
-#   (A) KHÁCH QUAN, deterministic, không-model = _pacing_penalty (đếm âm tiết). Vừa là
-#       CỔNG chọn câu cần sửa, vừa là LUẬT CHẤP NHẬN "chỉ nhận nếu ĐO ĐƯỢC là tốt hơn".
-#   (B) MODEL SELF-SCORE = Qwen tự chấm 1-5 + đề xuất bản viết lại (qua seam _generate).
-#       ADVISORY THUẦN: định hướng bản sửa; KHÔNG bao giờ là cổng chấp nhận, KHÔNG log.
-MAX_REVIEW_ROUNDS = 2          # trần cứng số vòng review (ENV QWEN_MAX_REVIEW_ROUNDS; <=0 tắt)
-# Bất đối xứng có chủ đích: TRÀN âm tiết (audio tràn ra ngoài cảnh) là lỗi lip-sync NẶNG
-# NHẤT (§2.1 "bằng đúng HOẶC nhỏ hơn") nên phạt gấp đôi HỤT (dead air, nhẹ hơn).
-PACING_OVERFLOW_WEIGHT = 2
-PACING_UNDERFLOW_WEIGHT = 1
-PACING_TOLERANCE = 2          # candidate iff _pacing_penalty(current) > 2 (câu khớp nhịp: bỏ qua)
-REVIEW_MIN_SYLLABLE_RATIO = 0.5   # sàn chống cắt cụt: từ chối bản có got < 0.5*orig
-MIN_REVISED_SYLLABLES = 2     # sàn TUYỆT ĐỐI: khi orig>=2, không nhận bản cụt về 1 từ
-                              # (0.5*orig <= 1 với orig<=2 nên ratio một mình KHÔNG cắn)
+# Một request hợp lệ có thể chứa tới hàng nghìn segment, trong khi Qwen chỉ được phép sinh
+# QWEN_MAX_NEW_TOKENS (mặc định 4096). Chia lô giữ mỗi lần generate trong biên hữu hạn.
+# Giới hạn bytes áp lên TOÀN prompt đã serialize, không chỉ original_text: UTF-8 bytes là
+# proxy token bảo thủ hơn len(str) cho CJK/emoji và còn tính cả id/speaker/JSON overhead.
+DEFAULT_TRANSLATION_BATCH_MAX_SEGMENTS = 32
+DEFAULT_TRANSLATION_BATCH_MAX_INPUT_BYTES = 12 * 1024
+DEFAULT_REVIEW_BATCH_MAX_SEGMENTS = 12
+DEFAULT_REVIEW_BATCH_MAX_INPUT_BYTES = 48 * 1024
+HARD_MAX_REVIEW_BATCH_SEGMENTS = 16
+HARD_MAX_REVIEW_BATCH_INPUT_BYTES = 64 * 1024
+MAX_QWEN_NEW_TOKENS = 8192
 
-# Ngôn ngữ mà count_syllables cho tín hiệu THẬT: vi = đếm từ; Latinh = đếm cụm nguyên âm
-# (xấp xỉ). CJK/Arab/Cyrillic/Thai... chạy qua nhánh vowel-group -> [aeiouy] không khớp ->
-# suy biến về 1 cho MỌI câu. Gate self-review trên tín hiệu suy biến sẽ "đo cải thiện" so
-# với baseline GIẢ -> cắt cụt bản dịch (fake-success). Nhận CẢ mã ISO LẪN tên tiếng Anh vì
-# target tới dạng TÊN ("Vietnamese") còn source tới dạng MÃ ("vi"/"en"/"ja").
-# QUAN TRỌNG: original_syllables được đếm ở phía SOURCE, nên PHẢI kiểm cả source lẫn target
-# đo được — nếu chỉ chặn target CJK mà bỏ sót source CJK, baseline penalty là giả -> cổng
-# biến thành động cơ cắt cụt bản dịch về 1 âm tiết (lỗ hổng do 2 verifier độc lập phát hiện).
-_PACING_MEASURABLE_LANGS = frozenset({
-    "vi", "vie", "vietnamese",
-    "en", "eng", "english",
-    "fr", "fra", "fre", "french",
-    "es", "spa", "spanish",
-    "de", "deu", "ger", "german",
-    "it", "ita", "italian",
-    "pt", "por", "portuguese",
-    "nl", "nld", "dut", "dutch",
-    "ro", "ron", "rum", "romanian",
-    "id", "ind", "indonesian",
-    "ms", "msa", "may", "malay",
-    "ca", "cat", "catalan",
+# Quality screening is always computed. ``TRANSLATION_QUALITY_MODE`` is the
+# canonical policy (observe/strict/off); the boolean below remains a migration
+# alias for deployments that still set TRANSLATION_QUALITY_GATE=1.
+TRANSLATION_QUALITY_MODE_ENV = "TRANSLATION_QUALITY_MODE"
+TRANSLATION_QUALITY_GATE_ENV = "TRANSLATION_QUALITY_GATE"
+TRANSLATION_ENSURE_TERMINAL_ENV = "TRANSLATION_ENSURE_TERMINAL"
+
+
+def _select_cuda_model_dtype(torch_module):
+    """Use BF16 only on devices that actually support it; otherwise use FP16."""
+
+    supports_bf16 = getattr(
+        torch_module.cuda, "is_bf16_supported", lambda: False
+    )()
+    return torch_module.bfloat16 if supports_bf16 else torch_module.float16
+
+# ── SELF-REVIEW (Qwen TỰ CHẤM ĐIỂM + TỰ CHỈNH SỬA) ──────────────────────────────────
+# Sau khi vòng dịch ban đầu cho ra bản HỢP LỆ, Qwen tự soi nghĩa/ngữ pháp/ngữ cảnh của
+# mọi câu và viết lại câu bị gắn cờ; các vòng sau chỉ tiếp tục xử lý câu LỆCH NHỊP.
+# Cơ chế dùng HAI tín hiệu TÁCH BẠCH (No-Fake-Success):
+#   (A) KHÁCH QUAN, deterministic, không-model = thời lượng nói dự kiến của ngôn ngữ
+#       đích so với duration. Vừa là cổng chọn, vừa là luật strict-better.
+#   (B) MODEL SELF-SCORE = Qwen tự chấm 4 chiều 1-5 + mã lỗi + bản viết lại.
+#       ADVISORY: có thể kích hoạt bản sửa provisional nhưng KHÔNG tạo semanticState=passed.
+MAX_REVIEW_ROUNDS = 2          # trần cứng số vòng review (ENV QWEN_MAX_REVIEW_ROUNDS; <=0 tắt)
+
+# Timing chấm trực tiếp thời lượng nói dự kiến của NGÔN NGỮ ĐÍCH so với số giây segment.
+# Sửa nghĩa có thể giữ cùng penalty; sửa câu tràn phải giảm penalty ngặt. Không cho Qwen
+# bịa thêm nội dung để lấp khoảng lặng.
+TIMING_REVIEW_PENALTY_TOLERANCE = 5.0
+REVIEW_MIN_TARGET_UNIT_RATIO = 0.5
+MIN_REVISED_SPEECH_UNITS = 2
+MIN_ACCEPTABLE_REVIEW_SCORE = 4
+ReviewIssueCode = Literal[
+    "meaning_unclear",
+    "meaning_changed",
+    "missing_information",
+    "hallucination",
+    "unnatural_target",
+    "grammar_error",
+    "wrong_register",
+    "entity_mismatch",
+    "number_mismatch",
+    "negation_mismatch",
+    "context_mismatch",
+    "timing_overflow",
+]
+_SEMANTIC_REVIEW_ISSUES = frozenset({
+    "meaning_unclear",
+    "meaning_changed",
+    "missing_information",
+    "hallucination",
+    "unnatural_target",
+    "grammar_error",
+    "wrong_register",
+    "entity_mismatch",
+    "number_mismatch",
+    "negation_mismatch",
+    "context_mismatch",
+})
+_REWRITE_SEMANTIC_RISK_ISSUES = frozenset({
+    "empty_translation",
+    "target_has_no_words",
+    "model_artifact",
+    "encoding_artifact",
+    "source_script_residue",
+    "copied_source",
+    "likely_untranslated",
+    "number_mismatch",
+    "protected_token_mismatch",
+    "negation_mismatch",
+    "boilerplate_hallucination",
+    "repeated_token_loop",
+    "extreme_length_ratio",
+    "too_short",
 })
 
 
@@ -107,14 +166,46 @@ class _ReviewItem(BaseModel):
     bị vứt). Các trường Optional -> row thiếu field degrade thành NO-OP (giữ bản cũ) thay
     vì đánh sập cả vòng."""
     id: int | str
-    score: Optional[int] = None
+    # ``score`` remains parse-compatible with older timing-only rows, but cannot
+    # trigger a semantic rewrite. New semantic rows must supply all four bounded
+    # dimensions so a timing problem cannot masquerade as a meaning verdict.
+    score: Optional[int] = Field(default=None, ge=1, le=5)
+    meaning_score: Optional[int] = Field(default=None, ge=1, le=5)
+    grammar_score: Optional[int] = Field(default=None, ge=1, le=5)
+    context_score: Optional[int] = Field(default=None, ge=1, le=5)
+    timing_score: Optional[int] = Field(default=None, ge=1, le=5)
+    issue_codes: List[ReviewIssueCode] = Field(default_factory=list, max_length=12)
     revised_text: Optional[str] = None
     emotion: Optional[str] = None
 
 
+class _QwenChatPrompt(str):
+    """A user prompt that carries its trusted system message through the legacy seam.
+
+    Keeping this as a ``str`` preserves CPU test fakes that patch ``_generate(prompt)``.
+    ``encode`` deliberately accounts for both chat messages in batching budgets.
+    """
+
+    def __new__(cls, user_prompt: str, system_prompt: str):
+        instance = super().__new__(cls, user_prompt)
+        instance.system_prompt = system_prompt
+        return instance
+
+    def encode(self, encoding: str = "utf-8", errors: str = "strict") -> bytes:
+        messages = [
+            {"role": "system", "content": self.system_prompt},
+            {"role": "user", "content": str(self)},
+        ]
+        serialized = json.dumps(messages, ensure_ascii=False, separators=(",", ":"))
+        return serialized.encode(encoding, errors)
+
+
 def count_syllables(text: str, lang: str = "en") -> int:
     """
-    Very basic syllable counter for calculating pacing.
+    Legacy source-side diagnostic retained in the nine-field output contract.
+
+    Lip-sync decisions no longer compare this value with target text; they use
+    target-language speech units against trusted segment duration.
     Vietnamese is typically 1 word = 1 syllable (separated by spaces).
     English uses a rough vowel group regex.
     """
@@ -163,6 +254,44 @@ class TranslationService:
         # Observability self-review — ĐẾM-ONLY (không plaintext): {'revised','rounds','skipped'}.
         # import-safe (không đụng transformers/VRAM); giữ nguyên bất biến import của test.
         self.last_review_stats: Optional[Dict[str, Any]] = None
+        # Count-only quality metadata. Never store plaintext in this field.
+        self.last_quality_stats: Optional[Dict[str, Any]] = None
+        # Optional per-segment count-only projection for the encrypted Analyze artifact.
+        # Each row contains only the trusted input ID, score, decision, semantic state,
+        # and bounded issue codes; source/target text is deliberately absent.
+        self.last_quality_reports: Optional[List[Dict[str, Any]]] = None
+
+    @staticmethod
+    def _quality_mode(explicit: Optional[str] = None) -> str:
+        """Resolve the quality policy without exposing any segment text.
+
+        ``observe`` computes metadata and lets the caller surface review items;
+        ``strict`` fails closed before TTS; ``off`` is reserved for diagnostics
+        and still keeps normalization enabled. The legacy boolean env remains a
+        compatibility alias for strict/observe.
+        """
+
+        raw = explicit
+        if raw is None:
+            raw = os.environ.get(TRANSLATION_QUALITY_MODE_ENV)
+        if raw is None:
+            legacy = os.environ.get(TRANSLATION_QUALITY_GATE_ENV, "0").strip().lower()
+            return "strict" if legacy in {"1", "true", "yes", "on", "strict", "reject"} else "observe"
+        mode = raw.strip().lower()
+        if mode in {"1", "true", "yes", "on", "strict", "reject"}:
+            return "strict"
+        if mode in {"0", "false", "no", "off", "observe", "review"}:
+            return "observe" if mode in {"observe", "review"} else "off"
+        raise RuntimeError("translation_quality_mode_invalid")
+
+    @classmethod
+    def _quality_gate_enabled(cls, explicit: Optional[str] = None) -> bool:
+        return cls._quality_mode(explicit) == "strict"
+
+    @staticmethod
+    def _quality_ensure_terminal() -> bool:
+        value = os.environ.get(TRANSLATION_ENSURE_TERMINAL_ENV, "0").strip().lower()
+        return value in {"1", "true", "yes", "on"}
 
     def load_model(self):
         """Nạp Qwen vào VRAM MỘT LẦN (gọi từ ModelManager.load_all_models).
@@ -196,10 +325,15 @@ class TranslationService:
                     "Dịch fail-closed thay vì chạy giả trên CPU."
                 )
 
+            # Qwen's config currently prefers bfloat16. Volta/Turing devices satisfy the
+            # worker's cc>=7 boundary but cannot execute BF16 kernels, so cast to FP16 unless
+            # the actual CUDA runtime explicitly reports BF16 support.
+            model_dtype = _select_cuda_model_dtype(torch)
+
             self.tokenizer = AutoTokenizer.from_pretrained(self.model_id)
             self.model = AutoModelForCausalLM.from_pretrained(
                 self.model_id,
-                torch_dtype="auto",
+                torch_dtype=model_dtype,
                 device_map="cuda",
             )
             self.is_loaded = True
@@ -227,7 +361,11 @@ class TranslationService:
 
         import torch
 
-        messages = [{"role": "user", "content": prompt}]
+        system_prompt = getattr(prompt, "system_prompt", None)
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": str(prompt)})
         # enable_thinking=False BẮT BUỘC: chế độ 'thinking' mặc định của Qwen3 phun chuỗi
         # <think> làm tăng độ trễ per-segment và chèn token phi-JSON phá ràng buộc JSON.
         text = self.tokenizer.apply_chat_template(
@@ -237,48 +375,220 @@ class TranslationService:
             enable_thinking=False,
         )
         inputs = self.tokenizer(text, return_tensors="pt").to(self.model.device)
+        try:
+            configured_max_new_tokens = int(
+                os.environ.get("QWEN_MAX_NEW_TOKENS", "4096")
+            )
+        except ValueError:
+            configured_max_new_tokens = 4096
+        max_new_tokens = max(
+            256, min(configured_max_new_tokens, MAX_QWEN_NEW_TOKENS)
+        )
         with torch.no_grad():
             # Greedy (do_sample=False) cho JSON xác định; max_new_tokens cấu hình qua ENV
             # cho lô nhiều segment. Guided decoding (xgrammar/outlines) là lever CHẤT LƯỢNG
             # ở prod — hardware-blocked ở đây; retry-max-3 mới là bảo chứng đúng đắn.
             generated = self.model.generate(
                 **inputs,
-                max_new_tokens=int(os.environ.get("QWEN_MAX_NEW_TOKENS", "4096")),
+                max_new_tokens=max_new_tokens,
                 do_sample=False,
             )
         out_tokens = generated[0][inputs["input_ids"].shape[-1]:]
         return self.tokenizer.decode(out_tokens, skip_special_tokens=True)
 
+    def _split_translation_batches(
+        self,
+        processed_segments: List[Dict[str, Any]],
+        target_language: str,
+        style: str,
+        source_language: str = "en",
+        prompt_profile: Optional[Dict[str, Any]] = None,
+    ) -> List[List[Dict[str, Any]]]:
+        """Chia lô xác định theo thứ tự, số segment và kích thước prompt UTF-8.
+
+        Không tách một segment thành nhiều phần vì ID là đơn vị nguyên tử của hợp đồng TTS.
+        Nếu ngay cả một singleton vượt budget, fail-closed trước khi chạm GPU thay vì âm
+        thầm gửi prompt quá cỡ hoặc cắt mất nội dung.
+        """
+        max_segments = max(
+            1,
+            int(os.environ.get(
+                "QWEN_BATCH_MAX_SEGMENTS",
+                str(DEFAULT_TRANSLATION_BATCH_MAX_SEGMENTS),
+            )),
+        )
+        max_input_bytes = max(
+            1,
+            int(os.environ.get(
+                "QWEN_BATCH_MAX_INPUT_BYTES",
+                str(DEFAULT_TRANSLATION_BATCH_MAX_INPUT_BYTES),
+            )),
+        )
+
+        batches: List[List[Dict[str, Any]]] = []
+        current: List[Dict[str, Any]] = []
+
+        for segment in processed_segments:
+            candidate = [*current, segment]
+            candidate_prompt = self._build_prompt(
+                target_language,
+                style,
+                candidate,
+                source_language=source_language,
+                prompt_profile=prompt_profile,
+            )
+            exceeds_count = len(candidate) > max_segments
+            exceeds_input = len(candidate_prompt.encode("utf-8")) > max_input_bytes
+
+            if not exceeds_count and not exceeds_input:
+                current = candidate
+                continue
+
+            if current:
+                batches.append(current)
+                current = [segment]
+            else:
+                current = candidate
+
+            singleton_prompt = self._build_prompt(
+                target_language,
+                style,
+                current,
+                source_language=source_language,
+                prompt_profile=prompt_profile,
+            )
+            if len(singleton_prompt.encode("utf-8")) > max_input_bytes:
+                raise RuntimeError(
+                    "Một segment vượt QWEN_BATCH_MAX_INPUT_BYTES; từ chối dịch "
+                    "thay vì gửi prompt quá giới hạn."
+                )
+
+        if current:
+            batches.append(current)
+        return batches
+
+    def _translate_batch(
+        self,
+        processed_segments: List[Dict[str, Any]],
+        target_language: str,
+        style: str,
+        batch_number: int,
+        batch_count: int,
+        source_language: str = "en",
+        prompt_profile: Optional[Dict[str, Any]] = None,
+    ) -> List[TranslatedSegment]:
+        """Dịch một lô với đúng retry/ID-parity/fail-closed của luồng cũ."""
+        prompt = self._build_prompt(
+            target_language,
+            style,
+            processed_segments,
+            source_language=source_language,
+            prompt_profile=prompt_profile,
+        )
+        last_error_name: Optional[str] = None
+        attempt_prompt = prompt
+
+        for attempt in range(1, MAX_TRANSLATION_ATTEMPTS + 1):
+            raw = self._generate(attempt_prompt)
+            try:
+                llm_segments = self._parse_and_validate(raw, processed_segments)
+            except (json.JSONDecodeError, ValidationError, ValueError) as e:
+                # ZERO-LOGGING: chỉ tên loại lỗi + metadata; KHÔNG str(e) (có thể nhúng
+                # nguyên đoạn output mô hình sinh ra).
+                last_error_name = type(e).__name__
+                logger.warning(
+                    f"Qwen output không hợp lệ ở batch {batch_number}/{batch_count} "
+                    f"(lần {attempt}/{MAX_TRANSLATION_ATTEMPTS}): {last_error_name}"
+                )
+                if attempt < MAX_TRANSLATION_ATTEMPTS:
+                    attempt_prompt = self._build_retry_prompt(prompt, attempt + 1)
+                continue
+
+            merged = self._merge(
+                llm_segments,
+                processed_segments,
+                source_language=source_language,
+                target_language=target_language,
+            )
+            logger.info(
+                f"Đã dịch {len(merged)} segment ở batch {batch_number}/{batch_count} "
+                f"(lần {attempt})."
+            )
+            return merged
+
+        raise RuntimeError(
+            f"Dịch Qwen thất bại ở batch {batch_number}/{batch_count} sau "
+            f"{MAX_TRANSLATION_ATTEMPTS} lần thử (lỗi cuối: {last_error_name})."
+        )
+
+    @staticmethod
+    def _build_retry_prompt(prompt: str, attempt: int) -> str:
+        """Change deterministic greedy input after a schema failure.
+
+        Repeating an identical prompt with ``do_sample=False`` reproduces the same
+        invalid output and only burns GPU time. The retry keeps the trusted system
+        role and original INPUT, but adds bounded corrective feedback without ever
+        embedding the rejected model output or plaintext in logs.
+        """
+
+        correction = (
+            f"RETRY_CORRECTION_ATTEMPT_{attempt}: The previous response failed JSON, "
+            "schema, or ID-parity validation. Re-read the same INPUT and regenerate "
+            "only the exact JSON contract.\n"
+        )
+        user_prompt = str(prompt)
+        marker = "INPUT:\n"
+        if marker in user_prompt:
+            before, input_json = user_prompt.split(marker, 1)
+            user_prompt = f"{before}{correction}\n{marker}{input_json}"
+        else:
+            user_prompt = f"{correction}\n{user_prompt}"
+        return _QwenChatPrompt(
+            user_prompt,
+            getattr(prompt, "system_prompt", ""),
+        )
+
     def translate_segments(self, segments: List[Dict[str, Any]], target_language: str, style: str,
-                           source_language: str = "en") -> List[Dict[str, Any]]:
+                           source_language: str = "en",
+                           prompt_profile: Optional[Dict[str, Any]] = None,
+                           quality_mode: Optional[str] = None,
+                           semantic_judges: Optional[List[str]] = None,
+                           semantic_judge_passed: Optional[bool] = None) -> List[Dict[str, Any]]:
         """
         Dịch các segment bằng Qwen cục bộ, đảm bảo Lip-sync + Emotion tagging.
 
-        source_language: ngôn ngữ GỐC của thoại, dùng để đếm âm tiết đúng cách. Bản cũ
-        ghim cứng "en" nên video tiếng Việt (đơn âm tiết) bị đếm sai bằng regex nguyên
-        âm tiếng Anh -> ước lượng pacing lệch. Nhánh "vi" trong count_syllables được gọi ở đây.
+        source_language: ngôn ngữ GỐC của thoại, dùng cho metadata nguồn và quality checks.
         """
         # Chuẩn bị dữ liệu đầu vào + tính âm tiết gốc (backend-agnostic; luôn chạy TRƯỚC
         # cả cổng fail-closed để việc căn âm tiết theo source_language không bị bỏ qua).
+        resolved_quality_mode = self._quality_mode(quality_mode)
+        self.last_quality_stats = None
+        self.last_quality_reports = None
+        # The old boolean could mark every segment as semantically correct without
+        # an independently auditable verdict. Keep accepting ``False`` from legacy
+        # callers during rollout, but fail closed on ``True`` and require the
+        # per-segment ``semantic_judges`` contract instead.
+        if semantic_judge_passed is True and semantic_judges is None:
+            raise RuntimeError("semantic_review_contract_required")
         processed_segments = []
         for seg in segments:
             orig_text = seg.get("text", seg.get("original_text", ""))
             orig_syllables = count_syllables(orig_text, lang=source_language)
 
-            # Tính duration nếu chưa có. start/end được CHUẨN HÓA về giây qua src.timecode
-            # (CC-1): client PHẢI gửi số giây, nhưng nếu lỡ tới ở dạng "HH:MM:SS" thì
-            # float() trần sẽ nổ -> rơi fallback -> pacing sai âm thầm. to_seconds xử lý cả hai.
+            # start/end là nguồn thời lượng DUY NHẤT vì audio mix/TTS cũng dùng chính span
+            # này. Không tin field ``duration`` tùy ý trong payload: một giá trị phóng đại
+            # có thể làm scorer cho qua câu sẽ tràn khung thật.
             start_s = to_seconds(seg.get("start", 0))
             end_s = to_seconds(seg.get("end", 0))
-            duration = seg.get("duration")
-            if duration is None:
-                duration = max(0.1, end_s - start_s)
+            duration = end_s - start_s
+            if not math.isfinite(duration) or duration <= 0:
+                raise ValueError("segment_end_must_be_after_start")
 
             processed_segments.append({
                 "id": seg.get("id", ""),
                 "start": start_s,
                 "end": end_s,
-                "duration": round(duration, 2),
+                "duration": round(duration, 3),
                 "original_text": orig_text,
                 "original_syllables": orig_syllables,
                 "speaker_id": seg.get("speaker", seg.get("speaker_id", "SPEAKER_UNKNOWN")),
@@ -292,51 +602,121 @@ class TranslationService:
                 "(load_model chưa chạy hoặc fail-closed trên máy không GPU)."
             )
 
-        prompt = self._build_prompt(target_language, style, processed_segments)
-
-        # Auto-Retry tối đa 3 (TRANSLATION_RULES.md §4). "Không hợp lệ" = JSON hỏng HOẶC
-        # pydantic ValidationError HOẶC sai tập id/số lượng segment. Emotion lệch enum
-        # KHÔNG tính là invalid (xem _merge: quy về NEUTRAL + log) vì nó chỉ là gợi ý ngữ
-        # điệu thứ yếu mà hạ nguồn đã map an toàn — đánh sập cả lô vì một nhãn lệch sẽ hạ
-        # độ tin cậy với mô hình nhỏ mà gần như không thêm tính đúng đắn.
-        last_error_name: Optional[str] = None
-        for attempt in range(1, MAX_TRANSLATION_ATTEMPTS + 1):
-            raw = self._generate(prompt)
-            try:
-                llm_segments = self._parse_and_validate(raw, processed_segments)
-            except (json.JSONDecodeError, ValidationError, ValueError) as e:
-                # ZERO-LOGGING: chỉ tên loại lỗi + metadata; KHÔNG str(e) (có thể nhúng
-                # nguyên đoạn output mô hình sinh ra).
-                last_error_name = type(e).__name__
-                logger.warning(
-                    f"Qwen output không hợp lệ "
-                    f"(lần {attempt}/{MAX_TRANSLATION_ATTEMPTS}): {last_error_name}"
-                )
-                continue
-
-            merged = self._merge(llm_segments, processed_segments)
-            logger.info(f"Đã dịch {len(merged)} segment (lần {attempt}).")
-
-            # SELF-REVIEW (best-effort, FAIL-OPEN): Qwen tự chấm điểm + tự chỉnh sửa những
-            # câu lệch nhịp. KHÁC vòng dịch ban đầu (fail-CLOSED/raise): một enhancement tùy
-            # chọn KHÔNG BAO GIỜ được đánh sập bản dịch ĐÃ hợp lệ -> mọi lỗi bất ngờ đều nuốt,
-            # giữ baseline. ZERO-LOGGING: chỉ TÊN loại lỗi (str(e) có thể nhúng plaintext).
-            if self._self_review_enabled():
-                try:
-                    merged = self._self_review(merged, target_language, source_language, style)
-                except Exception as e:
-                    logger.warning(f"Self-review bỏ qua: {type(e).__name__}")
-            return [seg.model_dump() for seg in merged]
-
-        # Hết 3 lần vẫn hỏng -> fail-closed. KHÔNG bịa, KHÔNG trả một phần (No-Fake-Success).
-        # Message chỉ chứa TÊN loại lỗi, không nhúng plaintext -> an toàn cho log/response.
-        raise RuntimeError(
-            f"Dịch Qwen thất bại sau {MAX_TRANSLATION_ATTEMPTS} lần thử "
-            f"(lỗi cuối: {last_error_name})."
+        batches = self._split_translation_batches(
+            processed_segments, target_language, style, source_language, prompt_profile
         )
 
-    def _build_prompt(self, target_language: str, style: str,
-                      processed_segments: List[Dict[str, Any]]) -> str:
+        # Dịch baseline của TẤT CẢ batch trước khi review. Nếu bất kỳ batch nào hết retry,
+        # exception thoát ra và caller không thể nhận kết quả một phần của các batch trước.
+        translated_batches: List[List[TranslatedSegment]] = []
+        for batch_number, batch in enumerate(batches, start=1):
+            translated_batches.append(self._translate_batch(
+                batch,
+                target_language,
+                style,
+                batch_number,
+                len(batches),
+                source_language,
+                prompt_profile,
+            ))
+
+        translated_segments = [
+            segment for batch in translated_batches for segment in batch
+        ]
+
+        # Review the complete ordered dialogue so adjacent context survives translation-batch
+        # boundaries. _self_review applies its own hard prompt chunks; it never rebuilds one
+        # unbounded prompt for the whole job.
+        if self._self_review_enabled():
+            try:
+                translated_segments = self._self_review(
+                    translated_segments,
+                    target_language,
+                    source_language,
+                    style,
+                    prompt_profile,
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Self-review job bỏ qua: {type(e).__name__}"
+                )
+
+        final_segments = [
+            segment.model_dump() for segment in translated_segments
+        ]
+        spoken_texts = [
+            self._spoken_timing_text(
+                str(segment.get("translated_text", "")), target_language
+            )
+            for segment in final_segments
+        ]
+        semantic_judge_list = (
+            list(semantic_judges) if semantic_judges is not None else None
+        )
+        revised_after_baseline = int(
+            (self.last_review_stats or {}).get("revised", 0)
+        )
+        if semantic_judge_list is not None and revised_after_baseline:
+            # A verdict supplied before generation cannot be content-bound to text
+            # that this call subsequently changed. Force a fresh review of the exact
+            # final candidate instead of carrying stale "passed" states forward.
+            semantic_judge_list = None
+            logger.warning(
+                f"Semantic verdict invalidated after {revised_after_baseline} "
+                "self-review revision(s)."
+            )
+        quality = quality_gate_segments(
+            final_segments,
+            source_key="original_text",
+            target_key="translated_text",
+            source_language=source_language,
+            target_language=target_language,
+            spoken_texts=spoken_texts,
+            semantic_judges=semantic_judge_list,
+            require_semantic_judge=True,
+        )
+        self.last_quality_stats = quality_gate_metadata(quality)
+        judge_states = (
+            [str(state).casefold() for state in semantic_judge_list]
+            if semantic_judge_list is not None
+            else ["not_run"] * len(final_segments)
+        )
+        self.last_quality_reports = [
+            {
+                "id": str(segment.get("id", "")),
+                "score": report.score,
+                "decision": report.decision,
+                "semanticState": judge_states[index],
+                "issueCodes": list(report.issues),
+            }
+            for index, (segment, report) in enumerate(
+                zip(final_segments, quality.reports, strict=True)
+            )
+        ]
+        if quality.decision == "reject":
+            logger.warning(
+                "Translation quality gate rejected output: "
+                f"segments={len(final_segments)} rejected={quality.rejected}"
+            )
+            if resolved_quality_mode == "strict":
+                raise RuntimeError("translation_quality_rejected")
+        elif resolved_quality_mode == "strict" and quality.decision != "accept":
+            logger.warning(
+                "Translation quality review is pending before strict render: "
+                f"segments={len(final_segments)} review={quality.review}"
+            )
+            raise RuntimeError("translation_quality_requires_review")
+        return final_segments
+
+    def _build_prompt(
+        self,
+        target_language: str,
+        style: str,
+        processed_segments: List[Dict[str, Any]],
+        *,
+        source_language: str = "en",
+        prompt_profile: Optional[Dict[str, Any]] = None,
+    ) -> str:
         """Xây prompt CÓ NHÚNG schema đầu ra + enum cảm xúc.
 
         Bản OpenAI lấy hình dạng output từ response_format=TranslationResult (server-side).
@@ -350,7 +730,6 @@ class TranslationService:
             {
                 "id": p["id"],
                 "duration": p["duration"],
-                "original_syllables": p["original_syllables"],
                 "speaker_id": p["speaker_id"],
                 "original_text": p["original_text"],
             }
@@ -358,18 +737,25 @@ class TranslationService:
         ]
         input_json = json.dumps({"input_segments": model_inputs}, ensure_ascii=False, indent=2)
 
-        return (
+        user_prompt = (
             "You are a professional dubbing translator for movies and videos.\n"
+            f"Source language: {source_language}.\n"
             f"Target language: {target_language}.\n"
             f"Style/Tone: {style}.\n\n"
             "CRITICAL RULES:\n"
-            "1. LIP-SYNC (Pacing): each input segment gives `duration` (seconds) and "
-            "`original_syllables`. Keep the translated syllable count strictly close to "
-            "`original_syllables` to match pacing. If the text is too long for the "
-            "duration, you MUST paraphrase or summarize.\n"
-            "2. EMOTION TAGGING: assign exactly one emotion per segment, chosen ONLY from "
+            "1. MEANING FIRST: translate every proposition faithfully. Preserve names, "
+            "numbers, dates, times, units, URLs, email addresses, negation, speaker intent, "
+            "and register. Do not summarize, invent, or drop a clause merely to shorten it.\n"
+            "2. LIP-SYNC (Pacing): each input segment gives trusted `duration` in seconds. "
+            "Keep natural target-language speech concise enough for that duration "
+            "while retaining meaning; prefer a natural paraphrase only when the literal form "
+            "would overrun the segment.\n"
+            "3. EMOTION TAGGING: assign exactly one emotion per segment, chosen ONLY from "
             "this enum: NEUTRAL, HAPPY, ANGRY, SAD, WHISPERING, SHOUTING.\n"
-            "3. STRICT JSON: respond with ONLY a JSON object of EXACTLY this shape — no "
+            "4. TARGET-LANGUAGE QUALITY: write idiomatic sentences in the target language, "
+            "using its normal spelling, diacritics, word order, and punctuation. Never emit "
+            "placeholders, source-script residue, boilerplate, or repeated filler words.\n"
+            "5. STRICT JSON: respond with ONLY a JSON object of EXACTLY this shape — no "
             "prose, no markdown, no code fences, no commentary:\n"
             '   {"segments": [{"id": <same id as input>, "translated_text": "<translation>", '
             '"emotion": "<ONE OF THE ENUM>"}]}\n'
@@ -377,6 +763,10 @@ class TranslationService:
             "Do NOT add or drop segments. Do NOT include start/end/duration/original_text "
             "in your output.\n\n"
             f"INPUT:\n{input_json}\n"
+        )
+        return _QwenChatPrompt(
+            user_prompt,
+            build_qwen_system_prompt(target_language, prompt_profile),
         )
 
     @staticmethod
@@ -421,7 +811,9 @@ class TranslationService:
         return llm_segments
 
     def _merge(self, llm_segments: List["_LlmSegment"],
-               processed_segments: List[Dict[str, Any]]) -> List[TranslatedSegment]:
+               processed_segments: List[Dict[str, Any]],
+               *, source_language: str = "en",
+               target_language: str = "Vietnamese") -> List[TranslatedSegment]:
         """Ghép translated_text + emotion (từ mô hình) lên mốc thời gian TIN CẬY từ đầu vào.
 
         Đây là phòng thủ chống mô hình nhỏ làm hỏng start/end/id/speaker_id: hợp đồng 9
@@ -438,6 +830,10 @@ class TranslationService:
                 # nguồn map unknown->NEUTRAL an toàn; emotion là gợi ý ngữ điệu thứ yếu.
                 coerced += 1
                 emotion = "NEUTRAL"
+            normalized_text = normalize_translation_text(
+                llm.translated_text,
+                ensure_terminal=self._quality_ensure_terminal(),
+            )
             merged.append(TranslatedSegment(
                 id=p["id"],
                 start=p["start"],
@@ -445,7 +841,7 @@ class TranslationService:
                 duration=p["duration"],
                 original_text=p["original_text"],
                 original_syllables=p["original_syllables"],
-                translated_text=llm.translated_text,
+                translated_text=normalized_text,
                 emotion=emotion,
                 speaker_id=p["speaker_id"],
             ))
@@ -462,28 +858,27 @@ class TranslationService:
         return v in {"1", "true", "yes", "on"}
 
     @staticmethod
-    def _pacing_measurable(language: str) -> bool:
-        """count_syllables có cho tín hiệu THẬT với ngôn ngữ này không?
+    def _spoken_timing_text(translated_text: str, target_language: str) -> str:
+        """Return the same private TN copy that the TTS boundary will synthesize."""
 
-        vi = đếm từ (thật); Latinh = đếm cụm nguyên âm (xấp xỉ thật). CJK/Arab/Cyrillic...
-        suy biến về 1 cho mọi câu -> gate self-review trên đó là gate trên tín hiệu GIẢ.
-        Chuẩn hóa primary subtag ('en-US'/'pt_BR' -> 'en'/'pt') rồi tra tập mã+tên."""
-        key = (language or "").strip().lower()
-        key = key.split("-")[0].split("_")[0]
-        return key in _PACING_MEASURABLE_LANGS
+        # Runtime import avoids a module cycle: text_preprocessing deliberately uses
+        # translation_quality for subtitle normalization. Production prewarms the NeMo
+        # grammars before Qwen; development uses the same explicit fallback as TTS.
+        from src.text_preprocessing import prepare_tts_text
 
-    def _pacing_penalty(self, translated_text: str, original_syllables: int,
-                        target_language: str) -> int:
-        """Điểm phạt lệch nhịp >= 0 (0 = khớp hoàn hảo). TRÀN phạt gấp đôi HỤT.
+        return prepare_tts_text(
+            translated_text, target_language, ensure_terminal=True
+        )
 
-        Hàm THUẦN (str,int,str)->int: gọi trực tiếp trên CPU, KHÔNG cần mock. Đây là tín
-        hiệu DUY NHẤT quyết định (a) câu nào là candidate và (b) chấp nhận/không một bản sửa
-        -> 'cải thiện' luôn là một phép giảm số nguyên ĐO ĐƯỢC, không phải lời tuyên bố."""
-        got = count_syllables(translated_text, target_language)
-        diff = got - original_syllables
-        if diff > 0:
-            return PACING_OVERFLOW_WEIGHT * diff
-        return PACING_UNDERFLOW_WEIGHT * (-diff)
+    @staticmethod
+    def _timing_penalty(translated_text: str, duration: float,
+                        target_language: str) -> float:
+        """Target-side speech overflow measured against trusted segment seconds."""
+
+        spoken = TranslationService._spoken_timing_text(
+            translated_text, target_language
+        )
+        return timing_overflow_penalty(spoken, target_language, duration)
 
     @staticmethod
     def _coerce_emotion(raw: Optional[str], fallback: str) -> str:
@@ -494,7 +889,9 @@ class TranslationService:
         return e if e in VALID_EMOTIONS else fallback
 
     def _build_review_prompt(self, target_language: str, style: str,
-                             review_items: List[Dict[str, Any]]) -> str:
+                             review_items: List[Dict[str, Any]],
+                             prompt_profile: Optional[Dict[str, Any]] = None,
+                             source_language: str = "en") -> str:
         """Prompt TỰ-SOI, CHẠY CỤC BỘ (chỉ tới _generate — KHÔNG cloud, KHÔNG log).
 
         Nhúng bản dịch hiện tại + số liệu pacing để Qwen tự chấm rồi viết gọn lại. Giấu
@@ -504,26 +901,43 @@ class TranslationService:
         input_json = json.dumps(
             {"review_segments": review_items}, ensure_ascii=False, indent=2
         )
-        return (
+        user_prompt = (
             "You are a strict senior dubbing-translation reviewer.\n"
+            f"Source language: {source_language}.\n"
             f"Target language: {target_language}.\n"
             f"Style/Tone: {style}.\n\n"
-            "For EACH segment below:\n"
-            "1. SELF-SCORE it 1-5 (1=poor, 5=perfect) combining: (a) fidelity of meaning to "
-            "`original_text`; (b) lip-sync pacing — compare `current_syllables` to "
-            "`original_syllables`; (c) emotion/style fit.\n"
-            "2. If pacing is off, REWRITE `revised_text` so its syllable count moves toward "
-            "`original_syllables` (PREFER equal-or-fewer when it overflows) WITHOUT losing "
-            "meaning or breaking the requested register. If it is already good, repeat the "
-            "current text unchanged.\n"
-            "3. You MAY set `emotion` from the enum ONLY if the current tag is clearly wrong.\n"
+            "Review EVERY input segment in array order. Use `context_before` and "
+            "`context_after` to resolve pronouns, continuity, register, and dialogue intent.\n"
+            "For EACH segment:\n"
+            "1. Give four integer scores from 1 to 5: `meaning_score` for faithful and "
+            "logically meaningful translation, `grammar_score` for natural target-language "
+            "grammar, `context_score` for consistency with adjacent dialogue, and "
+            "`timing_score` for speech fitting `available_seconds`.\n"
+            "2. Return `issue_codes` using ONLY this enum (use [] when clean): "
+            "meaning_unclear, meaning_changed, missing_information, hallucination, "
+            "unnatural_target, grammar_error, wrong_register, entity_mismatch, "
+            "number_mismatch, negation_mismatch, context_mismatch, timing_overflow.\n"
+            "3. If any score is below 4 or any issue exists, rewrite `revised_text` into a "
+            "complete, meaningful, natural sentence. Preserve every fact, entity, number, "
+            "negation, uncertainty, intent and register, while fitting the available time. "
+            "Never invent information and never pad an underfilled line. If clean, repeat "
+            "`current_translation` exactly.\n"
+            "4. You MAY set `emotion` from the enum ONLY if the current tag is clearly wrong.\n"
             "EMOTION enum: NEUTRAL, HAPPY, ANGRY, SAD, WHISPERING, SHOUTING.\n"
-            "STRICT JSON only — no prose, no markdown, no code fences — EXACTLY this shape:\n"
-            '   {"reviews": [{"id": <same id as input>, "score": <1-5>, '
-            '"revised_text": "<text>", "emotion": "<ONE OF THE ENUM>"}]}\n'
+            "This is an advisory self-review by the same model, not an independent semantic "
+            "approval. STRICT JSON only: no prose, rationale, markdown, or code fences. "
+            "Return EXACTLY this shape:\n"
+            '   {"reviews": [{"id": <same id>, "meaning_score": <1-5>, '
+            '"grammar_score": <1-5>, "context_score": <1-5>, "timing_score": <1-5>, '
+            '"issue_codes": ["<enum>"], "revised_text": "<text>", '
+            '"emotion": "<ONE OF THE ENUM>"}]}\n'
             "Keep each `id` EXACTLY; do NOT add/drop/renumber; do NOT output "
             "start/end/duration/speaker_id (not yours to set).\n\n"
             f"INPUT:\n{input_json}\n"
+        )
+        return _QwenChatPrompt(
+            user_prompt,
+            build_qwen_system_prompt(target_language, prompt_profile),
         )
 
     def _parse_review(self, raw: str, candidate_ids: set) -> Dict[str, "_ReviewItem"]:
@@ -542,34 +956,130 @@ class TranslationService:
         out: Dict[str, "_ReviewItem"] = {}
         for r in rows:
             if not isinstance(r, dict):
-                continue  # row không phải object -> no-op (không đánh sập cả vòng)
+                raise ValueError("review row must be an object")
             item = _ReviewItem(**r)  # ValidationError -> caller (FAIL-OPEN)
             rid = str(item.id)
-            if rid in candidate_ids and rid not in out:
-                out[rid] = item  # bỏ id lạ (không phải candidate); first-wins nếu trùng
+            if rid not in candidate_ids or rid in out:
+                raise ValueError("review id set mismatch")
+            out[rid] = item
+        if set(out) != candidate_ids:
+            raise ValueError("review id set mismatch")
         return out
 
+    def _split_review_chunks(
+        self,
+        candidates: List[Any],
+        review_items: List[Dict[str, Any]],
+        target_language: str,
+        source_language: str,
+        style: str,
+        prompt_profile: Optional[Dict[str, Any]],
+    ) -> List[tuple[List[Any], List[Dict[str, Any]]]]:
+        """Bound review prompts by count and serialized UTF-8 bytes.
+
+        Adjacent rows are already embedded in each item, so chunking does not lose
+        context at a chunk boundary. If a singleton is too large only because of its
+        duplicated neighbors, retry it without those optional context copies. A truly
+        oversized singleton is skipped fail-open rather than sent to the GPU.
+        """
+
+        def bounded_env(name: str, default: int, hard_max: int) -> int:
+            try:
+                configured = int(os.environ.get(name, str(default)))
+            except ValueError:
+                configured = default
+            return max(1, min(configured, hard_max))
+
+        max_segments = bounded_env(
+            "QWEN_REVIEW_MAX_SEGMENTS",
+            DEFAULT_REVIEW_BATCH_MAX_SEGMENTS,
+            HARD_MAX_REVIEW_BATCH_SEGMENTS,
+        )
+        max_input_bytes = bounded_env(
+            "QWEN_REVIEW_MAX_INPUT_BYTES",
+            DEFAULT_REVIEW_BATCH_MAX_INPUT_BYTES,
+            HARD_MAX_REVIEW_BATCH_INPUT_BYTES,
+        )
+
+        def prompt_bytes(pairs: List[tuple[Any, Dict[str, Any]]]) -> int:
+            prompt = self._build_review_prompt(
+                target_language,
+                style,
+                [item for _, item in pairs],
+                prompt_profile,
+                source_language=source_language,
+            )
+            return len(prompt.encode("utf-8"))
+
+        chunks: List[List[tuple[Any, Dict[str, Any]]]] = []
+        current: List[tuple[Any, Dict[str, Any]]] = []
+        oversized = 0
+
+        for candidate, item in zip(candidates, review_items):
+            trial = [*current, (candidate, item)]
+            if len(trial) <= max_segments and prompt_bytes(trial) <= max_input_bytes:
+                current = trial
+                continue
+
+            if current:
+                chunks.append(current)
+                current = []
+
+            singleton = [(candidate, item)]
+            if prompt_bytes(singleton) <= max_input_bytes:
+                current = singleton
+                continue
+
+            compact_item = dict(item)
+            compact_item["context_before"] = None
+            compact_item["context_after"] = None
+            compact_singleton = [(candidate, compact_item)]
+            if prompt_bytes(compact_singleton) <= max_input_bytes:
+                current = compact_singleton
+            else:
+                oversized += 1
+
+        if current:
+            chunks.append(current)
+        if oversized:
+            logger.warning(
+                f"Self-review skipped {oversized} oversized singleton segment(s)."
+            )
+
+        return [
+            (
+                [candidate for candidate, _ in chunk],
+                [item for _, item in chunk],
+            )
+            for chunk in chunks
+        ]
+
     def _self_review(self, merged: List[TranslatedSegment], target_language: str,
-                     source_language: str, style: str) -> List[TranslatedSegment]:
-        """Vòng tự-chấm + tự-sửa BOUNDED. Duyệt TOÀN BỘ danh sách, chỉ thay TẠI CHỖ những
-        candidate được cổng khách quan CHẤP NHẬN qua model_copy(update={text,emotion}) ->
-        9-field contract + ID-parity + merge-onto-trusted-timings BẤT BIẾN mọi vòng, kể cả
-        khi review echo bậy.
+                     source_language: str, style: str,
+                     prompt_profile: Optional[Dict[str, Any]] = None) -> List[TranslatedSegment]:
+        """Run a bounded same-model semantic/timing review without granting approval.
 
-        GATE ĐO LƯỜNG (No-Fake-Success): chỉ chạy khi CẢ target LẪN source đo được. Vì sao
-        CẢ HAI: original_syllables đếm ở phía SOURCE — với source CJK (native script),
-        count_syllables suy biến về 1 cho mọi câu -> baseline penalty GIẢ -> cổng sẽ 'cải
-        thiện' bằng cách cắt cụt bản dịch về 1 từ. Bỏ qua khi đầu nào không đo được.
+        Round one evaluates every sentence with adjacent context. A semantic rewrite is
+        provisional and is accepted only when deterministic structural risks and timing do
+        not worsen. Timing overflow still requires strict measurable improvement. Trusted
+        IDs, timestamps and speakers are never taken from model output.
 
-        FAIL-OPEN: mọi lỗi parse/JSON -> break, giữ current (đã hợp lệ), KHÔNG raise."""
+        This model can revise its draft, but cannot set the independent semantic verdict;
+        ``last_quality_reports`` therefore remains ``not_run`` unless a separate validated
+        reviewer is supplied. Any generation or schema failure is fail-open to the valid
+        baseline translation and never logs source or translated text.
+        """
         self.last_review_stats = {"revised": 0, "rounds": 0, "skipped": None}
 
-        if not (self._pacing_measurable(target_language)
-                and self._pacing_measurable(source_language)):
-            self.last_review_stats["skipped"] = "lang_not_measurable"
-            return merged
-
-        max_rounds = int(os.environ.get("QWEN_MAX_REVIEW_ROUNDS", str(MAX_REVIEW_ROUNDS)))
+        try:
+            configured_rounds = int(
+                os.environ.get("QWEN_MAX_REVIEW_ROUNDS", str(MAX_REVIEW_ROUNDS))
+            )
+        except ValueError:
+            configured_rounds = MAX_REVIEW_ROUNDS
+        # This is a real hard cap, not merely a default. A bad deployment value
+        # must not create an unbounded same-model loop or unexpected GPU spend.
+        max_rounds = max(0, min(configured_rounds, MAX_REVIEW_ROUNDS))
         if max_rounds <= 0:
             self.last_review_stats["skipped"] = "rounds_disabled"
             return merged
@@ -577,77 +1087,185 @@ class TranslationService:
         current = list(merged)
         total_revised = 0
         rounds_run = 0
-        for _ in range(max_rounds):
-            # (a) Chọn candidate bằng CỔNG KHÁCH QUAN (pacing penalty > tolerance).
+        for round_index in range(max_rounds):
+            # Round one reviews every sentence for meaning and fluency. Later
+            # rounds are reserved for lines that still measurably overflow.
             candidates = []
             for idx, seg in enumerate(current):
-                if seg.original_syllables <= 0:
-                    continue  # không tính được ratio -> bỏ (an toàn)
-                pen = self._pacing_penalty(
-                    seg.translated_text, seg.original_syllables, target_language
+                if seg.duration <= 0:
+                    continue
+                spoken = self._spoken_timing_text(
+                    seg.translated_text, target_language
                 )
-                if pen > PACING_TOLERANCE:
-                    candidates.append((idx, seg, pen))
+                pen = timing_overflow_penalty(
+                    spoken, target_language, seg.duration
+                )
+                if round_index == 0 or pen > TIMING_REVIEW_PENALTY_TOLERANCE:
+                    candidates.append((idx, seg, pen, spoken))
             if not candidates:
-                break  # HỘI TỤ: mọi câu đã trong dung sai nhịp
+                break
             rounds_run += 1
 
-            # (b) CHỈ gửi candidate cho Qwen tự chấm + viết lại (câu đạt nhịp: bỏ qua ->
-            #     trường hợp tốt = 0 lần _generate thêm). Giấu start/end khỏi mô hình.
-            review_items = [
-                {
+            review_items = []
+            for idx, seg, pen, spoken in candidates:
+                before = current[idx - 1] if idx > 0 else None
+                after = current[idx + 1] if idx + 1 < len(current) else None
+
+                def context_row(value: Optional[TranslatedSegment]) -> Optional[Dict[str, Any]]:
+                    if value is None:
+                        return None
+                    return {
+                        "id": value.id,
+                        "speaker_id": value.speaker_id,
+                        "original_text": value.original_text,
+                        "current_translation": value.translated_text,
+                    }
+
+                review_items.append({
                     "id": seg.id,
-                    "duration": seg.duration,
-                    "original_syllables": seg.original_syllables,
-                    "current_syllables": count_syllables(seg.translated_text, target_language),
+                    "speaker_id": seg.speaker_id,
+                    "available_seconds": seg.duration,
+                    "current_speech_units": speech_unit_count(
+                        spoken, target_language
+                    ),
+                    "estimated_spoken_seconds": estimate_spoken_duration_seconds(
+                        spoken, target_language
+                    ),
                     "current_emotion": seg.emotion,
                     "original_text": seg.original_text,
                     "current_translation": seg.translated_text,
-                }
-                for _, seg, _ in candidates
-            ]
-            raw = self._generate(self._build_review_prompt(target_language, style, review_items))
-            try:
-                reviews = self._parse_review(raw, {str(s.id) for _, s, _ in candidates})
-            except (json.JSONDecodeError, ValidationError, ValueError) as e:
-                # FAIL-OPEN: review hỏng -> giữ current (đã hợp lệ). ZERO-LOGGING: chỉ tên lỗi.
-                logger.warning(
-                    f"Self-review output không hợp lệ (vòng {rounds_run}): {type(e).__name__}"
-                )
-                break
+                    "deterministic_timing_overflow": (
+                        pen > TIMING_REVIEW_PENALTY_TOLERANCE
+                    ),
+                    "context_before": context_row(before),
+                    "context_after": context_row(after),
+                })
 
-            # (c) Áp bản sửa theo LUẬT CHẤP NHẬN khách quan (chỉ nhận nếu tốt hơn NGẶT).
+            review_chunks = self._split_review_chunks(
+                candidates,
+                review_items,
+                target_language,
+                source_language,
+                style,
+                prompt_profile,
+            )
+            reviews: Dict[str, _ReviewItem] = {}
+            for chunk_number, (candidate_chunk, item_chunk) in enumerate(
+                review_chunks, start=1
+            ):
+                try:
+                    raw = self._generate(self._build_review_prompt(
+                        target_language,
+                        style,
+                        item_chunk,
+                        prompt_profile,
+                        source_language=source_language,
+                    ))
+                    chunk_reviews = self._parse_review(
+                        raw,
+                        {str(segment.id) for _, segment, _, _ in candidate_chunk},
+                    )
+                    reviews.update(chunk_reviews)
+                except Exception as e:
+                    # Keep only stable metadata; parser exceptions may embed model text.
+                    logger.warning(
+                        f"Self-review output không hợp lệ (vòng {rounds_run}, "
+                        f"chunk {chunk_number}/{len(review_chunks)}): {type(e).__name__}"
+                    )
+                    continue
+
             progress = 0
-            for idx, seg, old_pen in candidates:
+            for idx, seg, old_pen, old_spoken in candidates:
                 rv = reviews.get(str(seg.id))
                 if rv is None or not rv.revised_text:
                     continue
-                new_text = rv.revised_text.strip()
+
+                review_scores = (
+                    rv.meaning_score,
+                    rv.grammar_score,
+                    rv.context_score,
+                    rv.timing_score,
+                )
+                complete_review_scores = all(
+                    score is not None for score in review_scores
+                )
+                semantic_flagged = bool(
+                    complete_review_scores
+                    and (
+                        set(rv.issue_codes).intersection(_SEMANTIC_REVIEW_ISSUES)
+                        or any(
+                            score < MIN_ACCEPTABLE_REVIEW_SCORE
+                            for score in review_scores[:3]
+                        )
+                    )
+                )
+                deterministic_timing_overflow = (
+                    old_pen > TIMING_REVIEW_PENALTY_TOLERANCE
+                )
+                # A clean semantic review cannot silently rewrite a sentence.
+                # Timing-only legacy rows remain accepted under the old strict gate.
+                if not semantic_flagged and not deterministic_timing_overflow:
+                    continue
+
+                new_text = normalize_translation_text(
+                    rv.revised_text,
+                    ensure_terminal=self._quality_ensure_terminal(),
+                )
                 if not new_text:
                     continue
-                orig = seg.original_syllables
-                new_syll = count_syllables(new_text, target_language)
-                # Sàn chống cắt cụt: từ chối bản quá ngắn DÙ penalty thấp. Sàn tuyệt đối
-                # MIN_REVISED_SYLLABLES chặn 'gutting về 1 từ' khi orig >= 2 (0.5*orig <= 1
-                # với orig <= 2 nên ratio một mình KHÔNG cắn).
-                floor = math.ceil(REVIEW_MIN_SYLLABLE_RATIO * orig)
-                if orig >= MIN_REVISED_SYLLABLES:
-                    floor = max(floor, MIN_REVISED_SYLLABLES)
-                if new_syll < floor:
+                old_units = speech_unit_count(seg.translated_text, target_language)
+                new_units = speech_unit_count(new_text, target_language)
+                # Sàn chống cắt cụt dựa trên chính bản dịch mục tiêu hiện tại, không dựa
+                # vào đơn vị của ngôn ngữ nguồn vốn không tương đương.
+                floor = math.ceil(REVIEW_MIN_TARGET_UNIT_RATIO * old_units)
+                if old_units >= MIN_REVISED_SPEECH_UNITS:
+                    floor = max(floor, MIN_REVISED_SPEECH_UNITS)
+                if new_units < floor:
                     continue
-                # CHỈ nhận khi ĐO ĐƯỢC tốt hơn NGẶT ('<'): strict-better ⊂ not-worse nên luôn
-                # thỏa "không tệ hơn"; đồng thời chống churn (dao động cùng-penalty) + không
-                # áp một hoán-đổi cùng-penalty không kiểm chứng được (rủi ro hồi quy nghĩa).
-                if self._pacing_penalty(new_text, orig, target_language) >= old_pen:
+                new_spoken = self._spoken_timing_text(new_text, target_language)
+                new_pen = timing_overflow_penalty(
+                    new_spoken, target_language, seg.duration
+                )
+                if deterministic_timing_overflow and new_pen >= old_pen:
+                    continue
+                # Meaning/grammar rewrites may keep the same duration, but can
+                # never consume more timing budget than the current sentence.
+                if not deterministic_timing_overflow and new_pen > old_pen:
+                    continue
+                old_quality = score_translation(
+                    seg.original_text,
+                    seg.translated_text,
+                    source_language=source_language,
+                    target_language=target_language,
+                    duration_seconds=seg.duration,
+                    spoken_text=old_spoken,
+                )
+                new_quality = score_translation(
+                    seg.original_text,
+                    new_text,
+                    source_language=source_language,
+                    target_language=target_language,
+                    duration_seconds=seg.duration,
+                    spoken_text=new_spoken,
+                )
+                newly_introduced_risks = (
+                    set(new_quality.issues) - set(old_quality.issues)
+                ).intersection(_REWRITE_SEMANTIC_RISK_ISSUES)
+                if newly_introduced_risks or new_quality.score < old_quality.score:
                     continue
                 new_emotion = self._coerce_emotion(rv.emotion, seg.emotion)
+                if (
+                    new_text == seg.translated_text
+                    and new_emotion == seg.emotion
+                ):
+                    continue
                 current[idx] = seg.model_copy(
                     update={"translated_text": new_text, "emotion": new_emotion}
                 )
                 progress += 1
                 total_revised += 1
             if progress == 0:
-                break  # HỘI TỤ: không có cải thiện ngặt nào ở vòng này
+                break
 
         if total_revised:
             # ĐẾM-ONLY (không plaintext): số câu ĐỔI dưới cổng khách quan ngặt.

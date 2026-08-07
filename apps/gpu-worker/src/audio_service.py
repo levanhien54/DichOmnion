@@ -6,6 +6,7 @@ import socket
 import tempfile
 import os
 import logging
+from collections.abc import Mapping
 from urllib.parse import urlparse
 
 logger = logging.getLogger("omnivoice.audio")
@@ -44,12 +45,31 @@ _ALLOWED_SCHEMES = frozenset(("https",))
 # tới một tài nguyên https CÔNG KHAI nhiều GB -> worker nuốt cả body vào RAM -> MemoryError /
 # bị OOM-killer hạ NGUYÊN tiến trình (kéo theo cả model thường trú VRAM) = DoS. SSRF gate chỉ
 # ràng buộc ĐÍCH chứ không ràng buộc KÍCH THƯỚC. Đọc theo chunk với bộ đếm CỨNG, hủy ngay khi
-# vượt trần (fail-closed). Client tách audio 16kHz mono (~32 KB/s, xem client/src-tauri/src/
-# main.rs) nên mặc định 1 GiB ~ 9 giờ thoại: quá đủ cho mọi video thực nhưng chặn payload phá
-# hoại. Env-tunable để box GPU lớn (Track A) nới ra mà không sửa mã.
-_MAX_DOWNLOAD_BYTES = max(
-    1, int(os.environ.get("WORKER_MAX_DOWNLOAD_BYTES", str(1024 * 1024 * 1024)))
-)
+# vượt trần (fail-closed).
+#
+# M2-S5 (#5): trần MẶC ĐỊNH = 30 MiB — mục tiêu input plan THỐNG NHẤT ở ba tầng
+# client/gateway/worker (client kiểm trước upload, Gateway HEAD-chặn trước dispatch, worker
+# là CHỐT CỨNG cuối cùng ngay cả khi hai tầng trên bị bỏ qua). Client tách audio 16kHz mono
+# (~32 KB/s, xem client/src-tauri/src/main.rs) nên 30 MiB ~ 16 phút thoại: đủ cho input hợp lệ
+# mà chặn payload phá hoại SÁT hơn nhiều so với 1 GiB cũ. Vẫn ENV-TUNABLE
+# (WORKER_MAX_DOWNLOAD_BYTES) để box GPU lớn (Track A) nới ra mà không sửa mã; rác không
+# parse được -> quay về mặc định (không nổ), 0/âm -> kẹp sàn 1 (không cho trần=0 vô hiệu kiểm).
+_DEFAULT_MAX_DOWNLOAD_BYTES = 30 * 1024 * 1024
+
+
+def _resolve_max_download_bytes(env: Mapping[str, str] = os.environ) -> int:
+    """Phân giải trần tải-về từ env (mặc định 30 MiB). Giá trị rác/không parse -> mặc định;
+    sàn cứng >= 1 để một cấu hình '0' không vô hiệu hoá kiểm tra kích thước."""
+    raw = env.get("WORKER_MAX_DOWNLOAD_BYTES")
+    if raw is None:
+        return _DEFAULT_MAX_DOWNLOAD_BYTES
+    try:
+        return max(1, int(raw))
+    except (TypeError, ValueError):
+        return _DEFAULT_MAX_DOWNLOAD_BYTES
+
+
+_MAX_DOWNLOAD_BYTES = _resolve_max_download_bytes()
 
 
 def _ip_is_public(addr: str) -> bool:
