@@ -44,6 +44,18 @@ _CJK_RATIO_RE = re.compile(
     r"(?P<left>[0-9零〇○一二两兩三四五六七八九十百千万萬亿億壹贰貳叁參肆伍陆陸柒捌玖拾佰仟]+)"
     r"比(?P<right>[0-9零〇○一二两兩三四五六七八九十百千万萬亿億壹贰貳叁參肆伍陆陸柒捌玖拾佰仟]+)"
 )
+# ``百分之三`` is a single percentage entity.  Parse it before the generic
+# numeral scan so the ``百`` prefix is not mistaken for an independent 100.
+_CJK_PERCENT_RE = re.compile(
+    r"百分之(?P<whole>[0-9零〇○一二两兩三四五六七八九十百千万萬亿億壹贰貳叁參肆伍陆陸柒捌玖拾佰仟]+)"
+    r"(?:[点點](?P<fraction>[0-9零〇○一二两兩三四五六七八九十百千万萬亿億壹贰貳叁參肆伍陆陸柒捌玖拾佰仟]+))?"
+)
+# A few high-frequency lexical compounds contain numeral glyphs but do not
+# denote quantities.  Keep this list deliberately small; measurements, ratios,
+# and ordinary cardinal phrases remain handled by the structural parser below.
+_CJK_NON_NUMERIC_IDIOM_RE = re.compile(
+    r"(?:千[萬万](?:不要|別|别)|[十拾]全[十拾]美|[萬万]一|千[千萬万]+)"
+)
 _CJK_UNKNOWN_QUANTITY_MARKERS = frozenset({"幾", "几", "數", "数", "多"})
 _CJK_MEASURE_UNITS = frozenset(
     {
@@ -890,6 +902,34 @@ def _cjk_number_values(value: str) -> list[str]:
 
     def overlaps(start: int, end: int) -> bool:
         return any(start < other_end and end > other_start for other_start, other_end in covered)
+
+    # Mark lexical compounds first so their numeral glyphs cannot be picked up
+    # by the generic magnitude pass (for example ``千萬不要`` or ``十全十美``).
+    for match in _CJK_NON_NUMERIC_IDIOM_RE.finditer(value):
+        covered.append(match.span())
+
+    for match in _CJK_PERCENT_RE.finditer(value):
+        whole = match.group("whole")
+        fraction = match.group("fraction")
+        if any(char in _CJK_UNKNOWN_QUANTITY_MARKERS for char in whole + (fraction or "")):
+            covered.append(match.span())
+            continue
+        whole_value = _cjk_integer(whole)
+        if whole_value is None:
+            covered.append(match.span())
+            continue
+        if fraction is None:
+            values.append(_canonical_number(f"{whole_value}%"))
+        else:
+            fraction_value = _cjk_integer(fraction)
+            if fraction_value is None:
+                covered.append(match.span())
+                continue
+            fraction_digits = "".join(str(_CJK_DIGITS.get(char, char)) for char in fraction)
+            if not fraction_digits.isdigit():
+                fraction_digits = str(fraction_value)
+            values.append(_canonical_number(f"{whole_value}.{fraction_digits}%"))
+        covered.append(match.span())
 
     for match in _CJK_DECIMAL_RE.finditer(value):
         whole = match.group("whole")

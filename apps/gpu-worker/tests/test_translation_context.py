@@ -167,3 +167,35 @@ def test_approximate_chinese_quantity_is_not_treated_as_exact_number():
             target_language="Vietnamese",
         )
         assert "number_mismatch" not in report.issues
+
+
+def test_chinese_percent_and_lexical_compounds_do_not_create_number_mismatch():
+    exact_percent = score_translation(
+        "百分之三",
+        "Chỉ 3%.",
+        source_language="Chinese",
+        target_language="Vietnamese",
+    )
+    assert "number_mismatch" not in exact_percent.issues
+
+    for source, target in (
+        ("千萬不要這樣做", "Đừng làm như vậy."),
+        ("十全十美", "Hoàn hảo."),
+    ):
+        report = score_translation(
+            source,
+            target,
+            source_language="Chinese",
+            target_language="Vietnamese",
+        )
+        assert "number_mismatch" not in report.issues
+
+
+def test_chinese_ratio_check_remains_exact_after_lexical_filtering():
+    report = score_translation(
+        "一比一",
+        "Tỷ lệ 1:1.",
+        source_language="Chinese",
+        target_language="Vietnamese",
+    )
+    assert "number_mismatch" not in report.issues
