@@ -54,7 +54,7 @@ _CJK_PERCENT_RE = re.compile(
 # denote quantities.  Keep this list deliberately small; measurements, ratios,
 # and ordinary cardinal phrases remain handled by the structural parser below.
 _CJK_NON_NUMERIC_IDIOM_RE = re.compile(
-    r"(?:千[萬万](?:不要|別|别)|[十拾]全[十拾]美|[萬万]一|千[千萬万]+)"
+    r"(?:千[萬万](?:不要|別|别)|[十拾]全[十拾]美|千千万万|千千萬萬)"
 )
 _CJK_UNKNOWN_QUANTITY_MARKERS = frozenset({"幾", "几", "數", "数", "多"})
 _CJK_MEASURE_UNITS = frozenset(
@@ -911,7 +911,11 @@ def _cjk_number_values(value: str) -> list[str]:
     for match in _CJK_PERCENT_RE.finditer(value):
         whole = match.group("whole")
         fraction = match.group("fraction")
-        if any(char in _CJK_UNKNOWN_QUANTITY_MARKERS for char in whole + (fraction or "")):
+        following = value[match.end():]
+        if (
+            any(char in _CJK_UNKNOWN_QUANTITY_MARKERS for char in whole + (fraction or ""))
+            or (following and following[0] in _CJK_UNKNOWN_QUANTITY_MARKERS)
+        ):
             covered.append(match.span())
             continue
         whole_value = _cjk_integer(whole)

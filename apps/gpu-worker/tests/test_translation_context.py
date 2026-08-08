@@ -199,3 +199,11 @@ def test_chinese_ratio_check_remains_exact_after_lexical_filtering():
         target_language="Vietnamese",
     )
     assert "number_mismatch" not in report.issues
+
+    large_cardinal = score_translation(
+        "千萬條魚",
+        "Mười triệu con cá.",
+        source_language="Chinese",
+        target_language="Vietnamese",
+    )
+    assert "number_mismatch" not in large_cardinal.issues
