@@ -1231,8 +1231,12 @@ class ModelManager:
                 raise RuntimeError("Analyze source separation is unavailable or incomplete.")
 
             analysis_audio_path = stems.vocals_path
+            source_language_hint = config.get("source_language")
+            asr_kwargs = {}
+            if isinstance(source_language_hint, str) and source_language_hint.strip():
+                asr_kwargs["language"] = source_language_hint
             asr = await _run_blocking(
-                asr_service.transcribe_analyze, analysis_audio_path
+                asr_service.transcribe_analyze, analysis_audio_path, **asr_kwargs
             )
             asr_segments = asr.get("segments", [])
             detected_language = asr.get("language") or ""

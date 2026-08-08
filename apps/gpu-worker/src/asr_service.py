@@ -5,6 +5,49 @@ from typing import List, Dict, Any
 logger = logging.getLogger("omnivoice.asr")
 logger.setLevel(logging.WARNING)
 
+# faster-whisper accepts ISO-639-1 language codes.  The client contract uses
+# human-readable names; a bounded map lets Analyze use an explicit source hint
+# without allowing arbitrary model/runtime options through the request.
+_WHISPER_LANGUAGE_ALIASES = {
+    "chinese": "zh",
+    "mandarin": "zh",
+    "cantonese": "zh",
+    "zh": "zh",
+    "zh-cn": "zh",
+    "zh-hans": "zh",
+    "english": "en",
+    "en": "en",
+    "japanese": "ja",
+    "ja": "ja",
+    "korean": "ko",
+    "ko": "ko",
+    "vietnamese": "vi",
+    "vi": "vi",
+    "french": "fr",
+    "fr": "fr",
+    "german": "de",
+    "de": "de",
+    "spanish": "es",
+    "es": "es",
+    "portuguese": "pt",
+    "pt": "pt",
+    "italian": "it",
+    "it": "it",
+    "thai": "th",
+    "th": "th",
+    "indonesian": "id",
+    "id": "id",
+}
+
+
+def whisper_language_code(value: Any) -> str | None:
+    """Return a supported Whisper code, or ``None`` to retain auto-detection."""
+
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().casefold().replace("_", "-")
+    return _WHISPER_LANGUAGE_ALIASES.get(normalized)
+
 class ASRService:
     def __init__(self):
         self.model = None
@@ -75,7 +118,9 @@ class ASRService:
             logger.error(f"Lỗi bóc băng: {type(e).__name__}")
             raise
 
-    def transcribe_analyze(self, audio_path: str) -> Dict[str, Any]:
+    def transcribe_analyze(
+        self, audio_path: str, *, language: str | None = None
+    ) -> Dict[str, Any]:
         """Bóc băng cho bước ANALYZE (Human-in-the-Loop): trả về ngôn ngữ GỐC phát hiện
         được + segments KÈM tín hiệu ĐỘ TIN CẬY thô của mô hình (avg_logprob, no_speech_prob).
 
@@ -88,7 +133,11 @@ class ASRService:
 
         logger.info(f"Bắt đầu bóc băng (analyze) file: {audio_path}")
         try:
-            segments, info = self.model.transcribe(audio_path, beam_size=5)
+            transcribe_kwargs = {"beam_size": 5}
+            language_code = whisper_language_code(language)
+            if language_code is not None:
+                transcribe_kwargs["language"] = language_code
+            segments, info = self.model.transcribe(audio_path, **transcribe_kwargs)
 
             results = []
             for idx, segment in enumerate(segments):
