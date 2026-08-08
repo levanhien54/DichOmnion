@@ -178,6 +178,14 @@ def test_chinese_percent_and_lexical_compounds_do_not_create_number_mismatch():
     )
     assert "number_mismatch" not in exact_percent.issues
 
+    approximate_percent = score_translation(
+        "百分之三十多",
+        "Hơn ba mươi phần trăm.",
+        source_language="Chinese",
+        target_language="Vietnamese",
+    )
+    assert "number_mismatch" not in approximate_percent.issues
+
     for source, target in (
         ("千萬不要這樣做", "Đừng làm như vậy."),
         ("十全十美", "Hoàn hảo."),
