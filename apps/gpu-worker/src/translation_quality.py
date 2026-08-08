@@ -29,6 +29,29 @@ _CJK_RANGES = (
 _TOKEN_RE = re.compile(r"[^\W\d_]+(?:['\u2019-][^\W\d_]+)*", re.UNICODE)
 _NUMBER_RE = re.compile(r"(?<![\w])[+-]?\d+(?:[.,]\d+)?%?(?![\w])")
 _NUMBER_SCAN_RE = re.compile(r"(?<![\w])[+-]?\d+(?:[.,]\d+)*%?(?![\w])")
+# Traditional/Simplified Chinese numerals are handled separately from the
+# Arabic semiotic scanner.  The parser is intentionally conservative: a bare
+# classifier such as ``一個`` is not treated as an exact entity, while a value
+# attached to a measurement/unit (``三噸``, ``一米四``) is.
+_CJK_NUMERAL_RE = re.compile(
+    r"[0-9零〇○一二两兩三四五六七八九十百千万萬亿億壹贰貳叁參肆伍陆陸柒捌玖拾佰仟]+"
+)
+_CJK_DECIMAL_RE = re.compile(
+    r"(?P<whole>[0-9零〇○一二两兩三四五六七八九十百千万萬亿億壹贰貳叁參肆伍陆陸柒捌玖拾佰仟]+)"
+    r"(?P<marker>米|公尺|點|点)(?P<fraction>[0-9零〇○一二两兩三四五六七八九十百千万萬亿億壹贰貳叁參肆伍陆陸柒捌玖拾佰仟]+)"
+)
+_CJK_RATIO_RE = re.compile(
+    r"(?P<left>[0-9零〇○一二两兩三四五六七八九十百千万萬亿億壹贰貳叁參肆伍陆陸柒捌玖拾佰仟]+)"
+    r"比(?P<right>[0-9零〇○一二两兩三四五六七八九十百千万萬亿億壹贰貳叁參肆伍陆陸柒捌玖拾佰仟]+)"
+)
+_CJK_UNKNOWN_QUANTITY_MARKERS = frozenset({"幾", "几", "數", "数", "多"})
+_CJK_MEASURE_UNITS = frozenset(
+    {
+        "米", "公尺", "公分", "厘米", "公升", "升", "噸", "吨", "斤", "公斤",
+        "克", "千克", "公斤", "條", "条", "項", "项", "年", "月", "日", "度",
+        "%", "公里", "千米", "公里", "公顷", "公頃",
+    }
+)
 _ACRONYM_RE = re.compile(r"(?<![\w])[A-ZĐ]{2,}(?![\w])")
 _PUNCT_RE = re.compile(r"(?:\.{3}|[,.!?;:])\s*")
 _ARTIFACT_RE = re.compile(
@@ -749,8 +772,184 @@ def _canonical_number(value: str) -> str:
     return f"{sign}{value}%" if percent else f"{sign}{value}"
 
 
-def _numbers(value: str) -> Counter[str]:
-    return Counter(_canonical_number(item) for item in _NUMBER_SCAN_RE.findall(value))
+_CJK_DIGITS = {
+    "零": 0,
+    "〇": 0,
+    "○": 0,
+    "一": 1,
+    "壹": 1,
+    "二": 2,
+    "两": 2,
+    "兩": 2,
+    "贰": 2,
+    "貳": 2,
+    "三": 3,
+    "叁": 3,
+    "參": 3,
+    "四": 4,
+    "肆": 4,
+    "五": 5,
+    "伍": 5,
+    "六": 6,
+    "陆": 6,
+    "陸": 6,
+    "七": 7,
+    "柒": 7,
+    "八": 8,
+    "捌": 8,
+    "九": 9,
+    "玖": 9,
+}
+_CJK_SMALL_UNITS = {"十": 10, "拾": 10, "百": 100, "佰": 100, "千": 1000, "仟": 1000}
+_CJK_LARGE_UNITS = {"万": 10_000, "萬": 10_000, "亿": 100_000_000, "億": 100_000_000}
+_MAX_CJK_NUMERAL_CHARS = 64
+_MAX_CJK_NUMERAL_VALUE = 10**15
+
+
+def _cjk_integer(value: str) -> int | None:
+    """Parse a bounded Chinese integer phrase, returning ``None`` if uncertain."""
+
+    if (
+        not value
+        or len(value) > _MAX_CJK_NUMERAL_CHARS
+        or any(
+            char not in _CJK_DIGITS
+            and char not in _CJK_SMALL_UNITS
+            and char not in _CJK_LARGE_UNITS
+            and not char.isdecimal()
+            for char in value
+        )
+    ):
+        return None
+    # A mixed Arabic/CJK phrase is accepted only when every Arabic run is an
+    # integer.  Decimal punctuation is handled by the outer Arabic scanner.
+    tokens: list[tuple[str, int]] = []
+    index = 0
+    while index < len(value):
+        char = value[index]
+        if char.isdecimal():
+            end = index + 1
+            while end < len(value) and value[end].isdecimal():
+                end += 1
+            try:
+                tokens.append(("digit", int(value[index:end])))
+            except (TypeError, ValueError):
+                return None
+            index = end
+            continue
+        if char in _CJK_DIGITS:
+            tokens.append(("digit", _CJK_DIGITS[char]))
+        elif char in _CJK_SMALL_UNITS:
+            tokens.append(("small", _CJK_SMALL_UNITS[char]))
+        else:
+            tokens.append(("large", _CJK_LARGE_UNITS[char]))
+        index += 1
+
+    # No unit means a sequence such as 二〇二六; read it digit-by-digit.  A
+    # single digit is also valid when the caller proved a measurement unit.
+    if all(kind == "digit" for kind, _ in tokens):
+        digits = "".join(str(number) for _, number in tokens)
+        try:
+            result = int(digits) if digits else None
+        except (TypeError, ValueError):
+            return None
+        return result if result is not None and result <= _MAX_CJK_NUMERAL_VALUE else None
+
+    total = 0
+    section = 0
+    pending = 0
+    for kind, number in tokens:
+        if kind == "digit":
+            pending = number
+            continue
+        if kind == "small":
+            # 十/百/千 without an explicit leading digit means one ten/hundred.
+            section += (pending or 1) * number
+            pending = 0
+            continue
+        section += pending
+        total += section * number
+        section = 0
+        pending = 0
+    result = total + section + pending
+    return result if result <= _MAX_CJK_NUMERAL_VALUE else None
+
+
+def _cjk_number_values(value: str) -> list[str]:
+    """Extract exact CJK quantities for the fidelity check.
+
+    This is deliberately a structural helper, not a Chinese tokenizer.  It
+    ignores approximate quantities (``幾百``/``数百``), ordinals, and bare
+    classifiers so a translation is not penalized for choosing a natural word
+    instead of an Arabic digit.  Measurement-attached values and ratios remain
+    checked because dropping them changes meaning.
+    """
+
+    covered: list[tuple[int, int]] = []
+    values: list[str] = []
+
+    def overlaps(start: int, end: int) -> bool:
+        return any(start < other_end and end > other_start for other_start, other_end in covered)
+
+    for match in _CJK_DECIMAL_RE.finditer(value):
+        whole = match.group("whole")
+        fraction = match.group("fraction")
+        if any(char in _CJK_UNKNOWN_QUANTITY_MARKERS for char in whole + fraction):
+            continue
+        whole_value = _cjk_integer(whole)
+        fraction_value = _cjk_integer(fraction)
+        if whole_value is None or fraction_value is None:
+            continue
+        # ``一米四`` means 1.4 in the source domain; preserve each fractional
+        # digit instead of treating ``四`` as forty.
+        fraction_digits = "".join(str(_CJK_DIGITS.get(char, char)) for char in fraction)
+        if not fraction_digits.isdigit():
+            fraction_digits = str(fraction_value)
+        values.append(_canonical_number(f"{whole_value}.{fraction_digits}"))
+        covered.append(match.span())
+
+    for match in _CJK_RATIO_RE.finditer(value):
+        left = match.group("left")
+        right = match.group("right")
+        if any(char in _CJK_UNKNOWN_QUANTITY_MARKERS for char in left + right):
+            continue
+        left_value = _cjk_integer(left)
+        right_value = _cjk_integer(right)
+        if left_value is None or right_value is None:
+            continue
+        values.extend((str(left_value), str(right_value)))
+        covered.append(match.span())
+
+    for match in _CJK_NUMERAL_RE.finditer(value):
+        start, end = match.span()
+        if overlaps(start, end):
+            continue
+        phrase = match.group(0)
+        if any(char in _CJK_UNKNOWN_QUANTITY_MARKERS for char in phrase):
+            continue
+        if start > 0 and value[start - 1] in {"幾", "几", "數", "数", "多"}:
+            continue
+        if start > 0 and value[start - 1] == "第":
+            continue
+        has_magnitude = any(char in _CJK_SMALL_UNITS or char in _CJK_LARGE_UNITS for char in phrase)
+        following = value[end:]
+        if following and following[0] in _CJK_UNKNOWN_QUANTITY_MARKERS:
+            continue
+        has_measure = any(following.startswith(unit) for unit in _CJK_MEASURE_UNITS)
+        if not has_magnitude and not has_measure:
+            continue
+        parsed = _cjk_integer(phrase)
+        if parsed is not None:
+            values.append(str(parsed))
+
+    return values
+
+
+def _numbers(value: str, language: str | None = None) -> Counter[str]:
+    numbers = [_canonical_number(item) for item in _NUMBER_SCAN_RE.findall(value)]
+    if language is None or _language_key(language) in _CJK_LANGUAGE_KEYS:
+        numbers.extend(_cjk_number_values(value))
+    return Counter(numbers)
 
 
 def _contains_negation(value: str, language: str) -> bool:
@@ -863,8 +1062,8 @@ def score_translation(
     source_units = _semantic_units(source, source_language)
     target_units = _semantic_units(normalized, target_language)
     length_ratio = _ratio(target_units, source_units)
-    source_numbers = _numbers(source)
-    target_numbers = _numbers(normalized)
+    source_numbers = _numbers(source, source_language)
+    target_numbers = _numbers(normalized, target_language)
     source_protected = _protected_tokens(source)
     target_protected = _protected_tokens(normalized)
 

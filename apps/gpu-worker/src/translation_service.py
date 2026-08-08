@@ -3,7 +3,7 @@ import json
 import re
 import math
 import logging
-from typing import List, Dict, Any, Optional, Literal
+from typing import List, Dict, Any, Optional, Literal, Mapping
 
 from pydantic import BaseModel, Field, ValidationError
 
@@ -49,6 +49,12 @@ HARD_MAX_REVIEW_BATCH_SEGMENTS = 16
 HARD_MAX_REVIEW_BATCH_INPUT_BYTES = 64 * 1024
 MAX_QWEN_NEW_TOKENS = 8192
 
+# A single source-neighbour on either side is enough to resolve common ASR
+# fragments (for example a noun introduced in one subtitle and its unit in the
+# next) without doubling an unbounded prompt.  The context is advisory only;
+# the current row remains the sole text the model must translate.
+TRANSLATION_CONTEXT_WINDOW = 1
+
 # Quality screening is always computed. ``TRANSLATION_QUALITY_MODE`` is the
 # canonical policy (observe/strict/off); the boolean below remains a migration
 # alias for deployments that still set TRANSLATION_QUALITY_GATE=1.
@@ -64,6 +70,36 @@ def _select_cuda_model_dtype(torch_module):
         torch_module.cuda, "is_bf16_supported", lambda: False
     )()
     return torch_module.bfloat16 if supports_bf16 else torch_module.float16
+
+
+def _bounded_asr_confidence(segment: Mapping[str, Any]) -> float | None:
+    """Read an ASR confidence without allowing non-finite prompt metadata.
+
+    Analyze normally receives ``avg_logprob`` from faster-whisper and older
+    callers may already provide a bounded ``confidence`` value.  The value is
+    only a hint for Qwen's context pass; it is never used to alter timestamps
+    or to manufacture a semantic verdict.
+    """
+
+    raw = segment.get("confidence")
+    if raw is None:
+        raw_logprob = segment.get("avg_logprob")
+        try:
+            logprob = float(raw_logprob)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not math.isfinite(logprob):
+            return None
+        # Whisper log probabilities are normally <= 0.  Clamp before exp so a
+        # malformed positive value cannot create an out-of-range signal.
+        raw = math.exp(min(0.0, logprob))
+    try:
+        confidence = float(raw)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(confidence):
+        return None
+    return round(max(0.0, min(1.0, confidence)), 4)
 
 # ── SELF-REVIEW (Qwen TỰ CHẤM ĐIỂM + TỰ CHỈNH SỬA) ──────────────────────────────────
 # Sau khi vòng dịch ban đầu cho ra bản HỢP LỆ, Qwen tự soi nghĩa/ngữ pháp/ngữ cảnh của
@@ -290,7 +326,11 @@ class TranslationService:
 
     @staticmethod
     def _quality_ensure_terminal() -> bool:
-        value = os.environ.get(TRANSLATION_ENSURE_TERMINAL_ENV, "0").strip().lower()
+        # Terminal punctuation is part of the subtitle contract by default.
+        # Operators may explicitly set ``TRANSLATION_ENSURE_TERMINAL=0`` for
+        # clause-fragment experiments; production must not depend on a missing
+        # environment key to get readable output.
+        value = os.environ.get(TRANSLATION_ENSURE_TERMINAL_ENV, "1").strip().lower()
         return value in {"1", "true", "yes", "on"}
 
     def load_model(self):
@@ -428,6 +468,14 @@ class TranslationService:
         batches: List[List[Dict[str, Any]]] = []
         current: List[Dict[str, Any]] = []
 
+        def compact_context(segment: Dict[str, Any]) -> Dict[str, Any]:
+            """Drop optional neighbours only when the configured byte cap needs it."""
+
+            compact = dict(segment)
+            compact.pop("context_before", None)
+            compact.pop("context_after", None)
+            return compact
+
         for segment in processed_segments:
             candidate = [*current, segment]
             candidate_prompt = self._build_prompt(
@@ -444,6 +492,22 @@ class TranslationService:
                 current = candidate
                 continue
 
+            if not exceeds_count and exceeds_input:
+                # Under a tight operator byte cap, preserve the batch and
+                # remove only optional context.  This keeps adjacent rows
+                # together while guaranteeing the same cap as legacy callers.
+                compact_candidate = [compact_context(item) for item in candidate]
+                compact_prompt = self._build_prompt(
+                    target_language,
+                    style,
+                    compact_candidate,
+                    source_language=source_language,
+                    prompt_profile=prompt_profile,
+                )
+                if len(compact_prompt.encode("utf-8")) <= max_input_bytes:
+                    current = compact_candidate
+                    continue
+
             if current:
                 batches.append(current)
                 current = [segment]
@@ -458,10 +522,24 @@ class TranslationService:
                 prompt_profile=prompt_profile,
             )
             if len(singleton_prompt.encode("utf-8")) > max_input_bytes:
-                raise RuntimeError(
-                    "Một segment vượt QWEN_BATCH_MAX_INPUT_BYTES; từ chối dịch "
-                    "thay vì gửi prompt quá giới hạn."
+                # Context is an optimization, never a reason to send an
+                # oversized prompt.  Retry this singleton without neighbours;
+                # the original text and all trusted fields remain intact.
+                compact = compact_context(segment)
+                compact_prompt = self._build_prompt(
+                    target_language,
+                    style,
+                    [compact],
+                    source_language=source_language,
+                    prompt_profile=prompt_profile,
                 )
+                if len(compact_prompt.encode("utf-8")) <= max_input_bytes:
+                    current = [compact]
+                else:
+                    raise RuntimeError(
+                        "Một segment vượt QWEN_BATCH_MAX_INPUT_BYTES; từ chối dịch "
+                        "thay vì gửi prompt quá giới hạn."
+                    )
 
         if current:
             batches.append(current)
@@ -593,6 +671,35 @@ class TranslationService:
                 "original_syllables": orig_syllables,
                 "speaker_id": seg.get("speaker", seg.get("speaker_id", "SPEAKER_UNKNOWN")),
             })
+
+        # Keep a bounded source window on every row.  The translation model can
+        # use it to resolve fragmented ASR terminology and pronouns, while the
+        # trusted row still controls the output ID and timing.  Do this after
+        # validating all spans so context never changes the original ordering.
+        for index, processed in enumerate(processed_segments):
+            before_index = index - TRANSLATION_CONTEXT_WINDOW
+            after_index = index + TRANSLATION_CONTEXT_WINDOW
+
+            def context_row(value: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+                if value is None:
+                    return None
+                return {
+                    "id": value["id"],
+                    "speaker_id": value["speaker_id"],
+                    "original_text": value["original_text"],
+                }
+
+            processed["context_before"] = context_row(
+                processed_segments[before_index] if before_index >= 0 else None
+            )
+            processed["context_after"] = context_row(
+                processed_segments[after_index]
+                if after_index < len(processed_segments)
+                else None
+            )
+            confidence = _bounded_asr_confidence(segments[index])
+            if confidence is not None:
+                processed["asr_confidence"] = confidence
 
         # Fail-closed TRƯỚC khi chạm mô hình: chưa nạp Qwen -> raise (trigger đổi từ "thiếu
         # OPENAI_API_KEY" sang "mô hình chưa nạp"). _generate KHÔNG được gọi ở nhánh này.
@@ -726,15 +833,24 @@ class TranslationService:
         mô hình làm hỏng mốc thời gian; mọi trường mốc thời gian ghép lại từ đầu vào tin cậy.
         """
         # Chỉ đưa các trường mô hình CẦN để dịch (giấu start/end khỏi output của mô hình).
-        model_inputs = [
-            {
+        model_inputs = []
+        for p in processed_segments:
+            row = {
                 "id": p["id"],
                 "duration": p["duration"],
                 "speaker_id": p["speaker_id"],
                 "original_text": p["original_text"],
             }
-            for p in processed_segments
-        ]
+            # Context is source-only and optional for direct service callers.
+            # Keep it outside the output contract so the model cannot alter
+            # trusted timing/speaker fields by echoing a neighbour.
+            if p.get("context_before") is not None:
+                row["context_before"] = p["context_before"]
+            if p.get("context_after") is not None:
+                row["context_after"] = p["context_after"]
+            if p.get("asr_confidence") is not None:
+                row["asr_confidence"] = p["asr_confidence"]
+            model_inputs.append(row)
         input_json = json.dumps({"input_segments": model_inputs}, ensure_ascii=False, indent=2)
 
         user_prompt = (
@@ -750,6 +866,12 @@ class TranslationService:
             "Keep natural target-language speech concise enough for that duration "
             "while retaining meaning; prefer a natural paraphrase only when the literal form "
             "would overrun the segment.\n"
+            "2a. CONTEXT WINDOW: rows may include `context_before` and `context_after` "
+            "containing adjacent source dialogue. Use them only to resolve ellipsis, "
+            "pronouns, terminology, and sentence continuity. Translate each row's own "
+            "`original_text` exactly once; never merge, split, copy, or output a context row. "
+            "An optional `asr_confidence` is a warning signal, not permission to invent or "
+            "silently omit uncertain facts.\n"
             "3. EMOTION TAGGING: assign exactly one emotion per segment, chosen ONLY from "
             "this enum: NEUTRAL, HAPPY, ANGRY, SAD, WHISPERING, SHOUTING.\n"
             "4. TARGET-LANGUAGE QUALITY: write idiomatic sentences in the target language, "

@@ -449,7 +449,11 @@ class ModelManager:
         # Nạp Whisper (Bóc băng) THẬT và thường trú VRAM.
         # asr_service.load_model đã fail-closed (raise) nếu thiếu thư viện/trọng số.
         from src.asr_service import asr_service
-        asr_service.load_model(model_size="base")
+        # Keep ``base`` as the conservative default; a server-owned deployment
+        # can pin ``small``/``large-v3`` through WHISPER_MODEL_SIZE when the GPU
+        # budget allows it, improving recognition of domain terminology.
+        whisper_model_size = os.environ.get("WHISPER_MODEL_SIZE", "base").strip() or "base"
+        asr_service.load_model(model_size=whisper_model_size)
 
         if not asr_service.is_loaded:
             # Không bao giờ đánh dấu "đã nạp" khi mô hình lõi chưa thực sự sẵn sàng.
