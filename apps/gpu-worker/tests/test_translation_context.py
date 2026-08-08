@@ -65,6 +65,7 @@ def test_translation_prompt_carries_bounded_adjacent_source_context(monkeypatch)
     assert rows[1]["asr_confidence"] == 0.37
     assert "CONTEXT WINDOW" in prompt
     assert "never merge, split, copy" in prompt
+    assert "NUMERIC PACING" in prompt
 
 
 def test_translation_prompt_derives_and_bounds_avg_logprob_confidence(monkeypatch):
